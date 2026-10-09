@@ -132,11 +132,43 @@ function makeHarness(opts) {
     },
   }
 
+  // ---- 虚拟时钟 ----
+  // 之前这里 setInterval 只是 `return 1`、回调**永远不会被执行** ——
+  // 于是「监督器定时器 → shouldBurst → burstTick」这条持续模式的主路径一次都没被测过,
+  // 只测了 shouldBurst() 这个纯判断。现在把定时器和 Date.now 都接到同一个虚拟时钟上,
+  // 测试可以自己"把时间往前推"来驱动真实路径。
+  const clock = { now: 1700000000000, id: 0, timers: new Map() }
+  function setTimer(fn, ms, repeat) {
+    const id = ++clock.id
+    const delay = Math.max(0, Number(ms) || 0)
+    clock.timers.set(id, { fn: fn, ms: delay, repeat: repeat, next: clock.now + delay })
+    return id
+  }
+  function advance(ms) {
+    const target = clock.now + Math.max(0, Number(ms) || 0)
+    let guard = 0
+    for (;;) {
+      if (guard++ > 20000) throw new Error('虚拟时钟:定时器疑似自激(超过 20000 次回调)')
+      let pickId = null
+      let pick = null
+      for (const [id, t] of clock.timers) {
+        if (t.next <= target && (pick === null || t.next < pick.next)) { pick = t; pickId = id }
+      }
+      if (pick === null) break
+      clock.now = pick.next
+      if (pick.repeat) pick.next = clock.now + pick.ms
+      else clock.timers.delete(pickId)
+      try { pick.fn() } catch (err) {}
+    }
+    clock.now = target
+  }
+
   const sandbox = {
     document,
     window: { innerWidth: 1200, innerHeight: 800, localStorage: storage },
     localStorage: storage,
     console,
+    __clock: clock,
     fetch: async (url, o) => {
       const u = String(url)
       const method = (o && o.method) || 'GET'
@@ -168,14 +200,17 @@ function makeHarness(opts) {
       }
       return { ok: false, status: 404, json: async () => null }
     },
-    setInterval(fn, ms) { return 1 },
-    setTimeout(fn, ms) { return 1 },
-    clearInterval() {},
-    clearTimeout() {},
+    setInterval(fn, ms) { return setTimer(fn, ms, true) },
+    setTimeout(fn, ms) { return setTimer(fn, ms, false) },
+    clearInterval(id) { clock.timers.delete(id) },
+    clearTimeout(id) { clock.timers.delete(id) },
   }
 
   const ctx = vm.createContext(sandbox)
   if (ES) sandbox.window.EventSource = ES
+  // Date.now 也必须接到虚拟时钟:否则定时器走了 10 秒而 Date.now() 还是真实时间,
+  // shouldBurst 永远算不出"已经过了间隔" —— 这正是"定时器没被测过"会漏掉的那类错。
+  vm.runInContext('Date.now = function () { return globalThis.__clock.now }', ctx)
   vm.runInContext('globalThis.__randQueue = []; Math.random = function () {'
     + ' return globalThis.__randQueue.length ? globalThis.__randQueue.shift() : 0.5; };', ctx)
   // 拿到上下文里那个数组的**真实引用**,避免跨 realm 属性同步的不确定性
@@ -185,7 +220,7 @@ function makeHarness(opts) {
   vm.runInContext(fs.readFileSync(OVERLAY, 'utf8'), ctx, { filename: 'overlay.js' })
 
   return {
-    state, sandbox, ctx, body, whaleImg, setRand, storage, ES,
+    state, sandbox, ctx, body, whaleImg, setRand, storage, ES, clock, advance,
     hook: sandbox.window.__dshDmgNumber,
     layer: () => document.getElementById('dsh-dmg-layer'),
   }
@@ -589,6 +624,63 @@ async function main() {
   eq(S7.hook.getConfig().tickSec, 3, '间隔也生效了')
 
   // ==========================================================================
+  // 关键:驱动虚拟时钟,让**定时器回调真的被执行**。
+  // 这一节存在的理由:之前 setInterval 的桩只是 return 1,回调永不执行 ——
+  // 「监督器 → shouldBurst → burstTick」这条持续模式主路径一次都没跑过,
+  // 于是"设置对了、金额也有,但就是不跳"这类问题测试根本看不见。
+  // ==========================================================================
+  section('22f. 持续模式:驱动虚拟时钟,验证定时器路径真的会跳')
+  const E7 = makeEventSourceStub()
+  const W4 = makeHarness({ eventSource: E7 })
+  W4.state.turn = { ok: true, seq: 5, amount: 0.09, tokens: 1, ts: 1 }
+  await flush(); await flush()
+  W4.hook.setConfig({ mode: 'working', tickSec: 2 })
+  W4.state.activity = { ok: true, working: true, mainWorking: true, since: 1, sessions: 1 }
+  await W4.hook.syncActivity()
+  const w4base = W4.layer().children.length
+  eq(W4.hook.getRuntime().working, true, '已进入「工作中」')
+  eq(W4.hook.getRuntime().lastKnownAmount, 0.09, '已拿到上一轮金额')
+  eq(W4.hook.getRuntime().supervisorOn, true, '监督器在跑')
+
+  W4.advance(1900)
+  eq(W4.layer().children.length, w4base, '不到 2 秒不跳')
+  W4.advance(300)                      // 累计 2.2s
+  eq(W4.layer().children.length, w4base + 1, '越过间隔后跳了一次(定时器路径通了)')
+  W4.advance(2000)                     // 累计 4.2s
+  eq(W4.layer().children.length, w4base + 2, '每满一个间隔再跳一次')
+  W4.advance(3000)
+  ok(W4.layer().children.length >= w4base + 3, '是持续输出,不是只跳一次',
+    'nodes=' + W4.layer().children.length)
+  const w4texts = W4.layer().children.map((n) => n.children[0].textContent)
+  eq(w4texts[0], '-¥0.09', '跳的数字 = 上一轮真实金额')
+
+  W4.state.activity = { ok: true, working: false, mainWorking: false, since: null, sessions: 0 }
+  await W4.hook.syncActivity()
+  eq(W4.hook.getRuntime().working, false, '已退出「工作中」')
+  const w4stop = W4.layer().children.length
+  W4.advance(10000)
+  eq(W4.layer().children.length, w4stop, '停止干活后时间继续走也不再跳')
+
+  section('22g. 持续模式:活动轮询自己也会把 working 拉起来(不依赖 SSE)')
+  const E8 = makeEventSourceStub()
+  const W5 = makeHarness({ eventSource: E8 })
+  W5.state.turn = { ok: true, seq: 2, amount: 0.05, tokens: 1, ts: 1 }
+  await flush(); await flush()
+  W5.hook.setConfig({ mode: 'working', tickSec: 1 })
+  eq(W5.hook.getRuntime().working, false, '一开始没有在干活')
+  // 宿主说在干活,但**不推 SSE frame** —— 只靠 3 秒的活动轮询
+  W5.state.activity = { ok: true, working: true, mainWorking: true, since: 1, sessions: 1 }
+  W5.advance(3100)
+  await flush(); await flush()
+  eq(W5.hook.getRuntime().working, true, '轮询把 working 拉起来了(SSE 不是必需品)')
+  const w5base = W5.layer().children.length
+  // 注意窗口要留够:监督器每 500ms 才检查一次,所以"满一个间隔"和"下一次检查"之间
+  // 最多再差 500ms —— 只推 1100ms 会正好错过第一个可跳的检查点(这也是虚拟时钟教会我们的事)。
+  W5.advance(2100)
+  ok(W5.layer().children.length > w5base, '随后就开始按间隔跳了',
+    'nodes=' + W5.layer().children.length)
+
+  // ==========================================================================
   // 宿主半区:真实加载 lib/index.js 并跑一遍 apply(),验证路由注册与 SSE 广播。
   // 这是"消耗几毫秒就到"那条链路里**宿主侧**的全部关键行为。
   // ==========================================================================
@@ -664,7 +756,11 @@ async function main() {
   ok(sse.frames.join('').indexOf('"isSubagent":true') >= 0, '子代理轮次被正确标记')
 
   fire({ id: 's1', header: {} }, { type: 'assistant/message', data: { turn: 1, usage: { inputTokens: 1 } } })
-  eq(sse.frames.join('').split('event: turn').length - 1, 1, '非 turn/end 的事件不广播')
+  eq(sse.frames.join('').split('event: turn').length - 1, 1, '非 turn/end 的事件不广播 turn 帧')
+  // ⚠️ 清理:assistant/message 现在会把该会话标记成"在干活"(见 26c),所以这里必须收尾,
+  //    否则后面几节会带着一个"永远忙碌"的会话开始,断言全部错位。
+  fire({ id: 's1', header: {} }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  sse.frames.length = 0
 
   section('26. 宿主半区:mainSessionOnly 让子代理不再即时触发')
   const cfgRoute = routes.filter((r) => r.path === '/dsh-dmg/config.json')[0]
@@ -742,6 +838,32 @@ async function main() {
   await statusRoute.handler({ method: 'GET', headers: { host: '127.0.0.1:3080' }, on() {} }, sr)
   const sj = JSON.parse(sbody)
   ok(sj.activity && typeof sj.activity.working === 'boolean', 'status.json 也带上了活动状态')
+
+  section('26c. 宿主半区:没有 turn/start 也能凭其它活动认出"在干活"')
+  for (const id of ['m1', 'm2', 's1', 'x1']) {
+    fire({ id: id, header: {} }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  }
+  act = await readActivity()
+  eq(act.working, false, '先清空到"闲着"')
+
+  sse.frames.length = 0
+  fire({ id: 'x1', header: {} }, { type: 'step/start', data: { turn: 1 } })   // 刻意不发 turn/start
+  act = await readActivity()
+  eq(act.working, true, 'step/start 也能把 working 拉起来(不依赖 turn/start)')
+  ok(sse.frames.join('').indexOf('event: activity') >= 0, '状态从闲变忙时照常推 activity 帧')
+
+  sse.frames.length = 0
+  for (let i = 0; i < 50; i++) {
+    fire({ id: 'x1', header: {} }, { type: 'assistant/message', data: { turn: 1, usage: {} } })
+  }
+  eq(sse.frames.length, 0, '已在"工作中"时后续活动事件一帧都不推(标记幂等,不会打爆 SSE)')
+  act = await readActivity()
+  eq(act.working, true, '高频活动之后仍然在"工作中"')
+  eq(act.sessions, 1, '而且只有一个会话被计入')
+
+  fire({ id: 'x1', header: {} }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  act = await readActivity()
+  eq(act.working, false, 'turn/end 负责收尾')
 
   section('27. 宿主半区:信任栅栏的四种情形(与 dsh-whale-widget 同款语义)')
   // 设计要点:宿主栅栏**可用**时,非回环 Host 交给它判 —— 它才知道 dsh 自己的 --trusted-host
