@@ -208,7 +208,7 @@ function makeSandbox(opts) {
     querySelectorAll(sel) { return body.querySelectorAll(sel) },
   }
 
-  const net = { puts: [], cfg: opts.cfg || null, turn: { ok: true, seq: 1, amount: 0.05, tokens: 1, ts: 1 } }
+  const net = { puts: [], cfg: opts.cfg || null, turn: { ok: true, seq: 1, amount: 0.05, tokens: 1, ts: 1 }, stripKeys: null }
   const registered = []
 
   const win = {
@@ -234,8 +234,13 @@ function makeSandbox(opts) {
           let body = null
           try { body = JSON.parse(o.body) } catch (err) {}
           net.puts.push(body)
-          net.cfg = body
-          return { ok: true, status: 200, json: async () => ({ ok: true, config: body, file: 'x' }) }
+          let stored = body
+          if (net.stripKeys && net.stripKeys.length) {   // 模拟旧宿主静默丢掉不认识的键
+            stored = Object.assign({}, body)
+            for (const k of net.stripKeys) delete stored[k]
+          }
+          net.cfg = stored
+          return { ok: true, status: 200, json: async () => ({ ok: true, config: stored, file: 'x' }) }
         }
         return { ok: true, status: 200, json: async () => net.cfg }
       }
@@ -334,15 +339,22 @@ async function main() {
 
   section('6. 保存载荷换算与夹取')
   const patch = P.buildPatch({
-    enabled: true, minFen: 2, maxFen: 20, minPct: 50,
+    enabled: true, mode: 'working', tickSec: 7, minFen: 2, maxFen: 20, minPct: 50,
     pushEnabled: true, mainSessionOnly: false, pollMs: 10,
     prefix: '-¥', decimals: 2, color: '#ff3b30', strokeColor: '#ffffff', strokeWidth: 3,
-    fontSizePx: 30, risePx: 96, riseMs: 1200, jitterX: 0.18, maxStack: 6,
+    fontSizePx: 30, risePx: 96, riseMs: 1800, jitterPct: 18, maxStack: 6,
   })
   eq(patch.minAmount, 0.02, '下限 2 分 → minAmount 0.02 元')
   eq(patch.maxAmount, 0.2, '上限 20 分 → maxAmount 0.2 元')
   eq(patch.minProbability, 0.5, '50% → minProbability 0.5')
   eq(patch.pollMs, 250, '轮询间隔低于下限时被夹到 250ms')
+  eq(patch.mode, 'working', '模式原样带上')
+  eq(patch.tickSec, 7, '间隔原样带上')
+  eq(patch.jitterX, 0.18, '界面填 18% → jitterX 0.18')
+  eq(P.buildPatch({ jitterPct: 100 }).jitterX, 1, '横向偏移 100% → jitterX 1')
+  eq(P.buildPatch({ mode: '乱填' }).mode, 'turnEnd', '非法模式回落到 turnEnd')
+  eq(P.buildPatch({ tickSec: 99999 }).tickSec, 3600, '间隔超上限被夹到 3600s')
+  eq(P.buildPatch({ tickSec: 0 }).tickSec, 5, '间隔填 0 → 回落默认 5s')
   eq(P.buildPatch({ pollMs: 999999 }).pollMs, 60000, '轮询间隔超上限时被夹到 60000ms')
   eq(P.buildPatch({ minPct: 300 }).minProbability, 1, '概率 >100% 被夹到 1')
 
@@ -357,8 +369,9 @@ async function main() {
   const myCard = myMask.querySelector('.dshwv-bubcard')
   ok(!!myCard, '卡片本体存在')
   ok(allText(myCard).indexOf('受击提示设置') >= 0, '卡片标题正确')
+  ok(allText(myCard).indexOf('跳动规则') >= 0, '含「跳动规则」区块')
   ok(allText(myCard).indexOf('概率曲线') >= 0, '含概率曲线区块')
-  ok(allText(myCard).indexOf('预览与试算') >= 0, '含预览与试算区块')
+  ok(allText(myCard).indexOf('外观') >= 0, '含「外观」区块')
 
   const numInputs = myCard.querySelectorAll('input').filter((i) => i.type === 'number')
   eq(numInputs[0].value, '1', '下限输入框预填 1 分')
@@ -366,6 +379,30 @@ async function main() {
   eq(numInputs[2].value, '25', '概率输入框预填 25%')
   const svg = myCard.querySelectorAll('svg')[0]
   ok(!!svg && String(svg.innerHTML).indexOf('<path') >= 0, '概率曲线已绘制(<path> 存在)')
+
+  section('7b. 基础项在外面 + 高级默认折起')
+  const modeSel = myCard.querySelectorAll('select')[0]
+  ok(!!modeSel, '模式下拉在卡片里')
+  eq(modeSel.value, 'turnEnd', '默认是「每轮结束时」')
+  eq(modeSel.children.length, 2, '两个模式选项')
+  eq(numInputs[3].value, '5', '间隔输入框预填 5 秒')
+  eq(numInputs[3].disabled, true, '「每轮结束时」模式下间隔不可用')
+  eq(numInputs[5].value, '1800', '显示时长预填 1800ms(已放慢)')
+  eq(numInputs[6].value, '18', '横向偏移按百分比展示(默认 18%)')
+  ok(allText(myCard).indexOf('每轮结束时按上面的区间概率跳一次') >= 0, '基础区说明了当前模式的规则')
+
+  // 高级区:内容在折叠体里,且默认 display:none
+  const advBody = myCard.querySelectorAll('div').filter((d) => d.style && d.style.display === 'none'
+    && d.querySelectorAll('input').filter((i) => i.type === 'number').length > 0)[0]
+  ok(!!advBody, '找到了默认折起的高级区(里面有数字控件)')
+  ok(advBody.querySelectorAll('input').filter((i) => i.type === 'number').length >= 5,
+    '高级区里确实装着描边/文本/上浮/同屏/轮询等控件')
+
+  // 切换模式:说明文字与间隔可用性都要跟着变
+  modeSel.value = 'working'
+  modeSel.__fire('change')
+  eq(numInputs[3].disabled, false, '切到持续模式后间隔可用了')
+  ok(allText(myCard).indexOf('无条件跳一次') >= 0, '说明文字切换成持续模式的规则')
 
   section('8. 预览按钮不花钱')
   const before = hook.getRuntime().onScreen
@@ -377,8 +414,8 @@ async function main() {
 
   section('9. 试算按钮验证概率')
   const simInputs = myCard.querySelectorAll('input').filter((i) => i.type === 'number')
-  simInputs[3].value = '10'      // 试算金额 = 上限 10 分
-  simInputs[4].value = '1000'    // 掷 1000 次
+  simInputs[12].value = '10'     // 试算金额 = 上限 10 分
+  simInputs[13].value = '1000'   // 掷 1000 次
   const runBtn = myCard.querySelectorAll('button').filter((b) => String(b.textContent) === '跑')[0]
   ok(!!runBtn, '找到「跑」按钮')
   runBtn.__fire('click')
@@ -395,7 +432,9 @@ async function main() {
   eq(S.net.puts[0].minAmount, 0.02, 'PUT 载荷:下限 = 0.02 元')
   eq(S.net.puts[0].minProbability, 0.4, 'PUT 载荷:概率 = 0.4')
   eq(S.net.puts[0].enabled, true, 'PUT 载荷:开关保留')
+  eq(S.net.puts[0].mode, 'working', 'PUT 载荷:模式带上了刚才选的持续模式')
   eq(hook.getConfig().minAmount, 0.02, '保存成功后本地配置立即生效')
+  eq(hook.getConfig().mode, 'working', '本地配置的模式也立刻生效')
   eq(hook.getRuntime().pollMs, 2000, '未改动的轮询间隔保持 2000ms')
   eq(entry.__summary.textContent, '2 分–10 分 · 40%→100%', '入口行摘要跟着刷新')
   ok(!hook.panel.isOpen(), '保存成功后卡片自动关闭')
@@ -407,10 +446,10 @@ async function main() {
   const ni2 = card2.querySelectorAll('input').filter((i) => i.type === 'number')
   // 守卫:曾经真的踩过「控件 new 出来了、却忘了 appendChild 进那一行」——
   // 结果界面上少一个输入框,而 collect() 永远读到默认值,静默失效。
-  // 所以这里把"数字控件必须齐"钉死(下限/上限/概率/试算金额/试算次数/轮询/字号/描边宽/小数位/上浮/时长/抖动/同屏)。
-  eq(ni2.length, 13, '卡片里的数字输入框数量正确(少一个就说明有控件没挂进 DOM)')
-  eq(ni2[5].value, '2000', '轮询间隔输入框真的在 DOM 里(第 6 个数字控件)')
-  ni2[5].value = '100'
+  // 顺序:0下限 1上限 2概率 3间隔 4字号 5时长 6横向偏移 | 高级:7轮询 8描边宽 9小数位 10上浮 11同屏 | 试算:12金额 13次数
+  eq(ni2.length, 14, '卡片里的数字输入框数量正确(少一个就说明有控件没挂进 DOM)')
+  eq(ni2[7].value, '2000', '轮询间隔输入框真的在 DOM 里(第 8 个数字控件)')
+  ni2[7].value = '100'
   card2.querySelectorAll('button').filter((b) => String(b.textContent) === '保存')[0].__fire('click')
   await flush(); await flush()
   eq(S.net.puts.length, 2, '第二次保存发出了 PUT')
@@ -418,12 +457,31 @@ async function main() {
   eq(hook.getRuntime().pollMs, 250, '夹取结果真的落到了重建后的定时器上')
   ok(!hook.panel.isOpen(), '第二次保存后卡片也关闭了')
 
+  section('10c. 宿主把键丢掉时,面板要明说"重启客户端"而不是静默成功')
+  hook.panel.open()
+  const card3 = S.body.querySelectorAll('.dshwv-bubmask')
+    .filter((m) => m.getAttribute('data-dsh-dmg'))[0].querySelector('.dshwv-bubcard')
+  S.net.stripKeys = ['mode', 'tickSec']   // 模拟旧宿主
+  const mode3 = card3.querySelectorAll('select')[0]
+  mode3.value = 'working'
+  mode3.__fire('change')
+  card3.querySelectorAll('button').filter((b) => String(b.textContent) === '保存')[0].__fire('click')
+  await flush(); await flush()
+  const msg3 = allText(card3)
+  ok(msg3.indexOf('宿主没接受这些键') >= 0, '明确说出宿主没接受键')
+  ok(msg3.indexOf('mode') >= 0 && msg3.indexOf('tickSec') >= 0, '点名具体是哪些键')
+  ok(msg3.indexOf('重启') >= 0, '给出可操作的指引:重启客户端')
+  ok(msg3.indexOf('局域网') < 0, '不会把"版本不匹配"误报成"回环/权限"问题')
+  ok(hook.panel.isOpen(), '保存失败时卡片保持打开,方便改回去')
+  S.net.stripKeys = null
+  hook.panel.close()
+
   section('11. 入口行勾选框 = 总开关(立即保存)')
   entry.__check.checked = false
   entry.__check.__fire('change')
   await flush(); await flush()
-  eq(S.net.puts.length, 3, '勾选框变化触发了 1 个 PUT')
-  eq(S.net.puts[2].enabled, false, 'PUT 载荷:enabled = false')
+  eq(S.net.puts.length, 4, '勾选框变化触发了 1 个 PUT(前 3 个来自 10/10b/10c)')
+  eq(S.net.puts[3].enabled, false, 'PUT 载荷:enabled = false')
   eq(entry.__summary.textContent, '已关闭', '入口行摘要立即显示「已关闭」')
 
   section('12. 鲸鱼面板不存在时不崩、且可手动补挂')

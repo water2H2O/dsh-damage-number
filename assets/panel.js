@@ -101,6 +101,8 @@
   function buildPatch(v) {
     return {
       enabled: !!v.enabled,
+      mode: v.mode === 'working' ? 'working' : 'turnEnd',
+      tickSec: Math.max(0.5, Math.min(3600, Number(v.tickSec) || 5)),
       minAmount: yuanOf(v.minFen),
       maxAmount: yuanOf(v.maxFen),
       minProbability: Math.max(0, Math.min(1, Number(v.minPct) / 100)) || 0,
@@ -114,8 +116,9 @@
       strokeWidth: Math.max(0, Number(v.strokeWidth) || 0),
       fontSizePx: Math.max(8, Number(v.fontSizePx) || 30),
       risePx: Math.max(0, Number(v.risePx) || 0),
-      riseMs: Math.max(120, Number(v.riseMs) || 1200),
-      jitterX: Math.max(0, Number(v.jitterX) || 0),
+      riseMs: Math.max(200, Number(v.riseMs) || 1800),
+      // 界面按百分比填(「横向偏移 18%」比「jitterX 0.18」友好),配置里仍是 0~1 的比例
+      jitterX: Math.max(0, Math.min(1, (Number(v.jitterPct) || 0) / 100)),
       maxStack: Math.max(1, Math.round(Number(v.maxStack) || 1)),
     }
   }
@@ -211,6 +214,42 @@
     b.addEventListener('click', onClick)
     return b
   }
+  function modeSelect(value) {
+    var s = mk('select', '', 'font-size:12px;color:#203170;border:1px solid rgba(32,49,112,.4);'
+      + 'border-radius:6px;padding:2px 4px;background:#fff;box-sizing:border-box;max-width:180px')
+    var o1 = document.createElement('option')
+    o1.value = 'turnEnd'
+    o1.textContent = '每轮结束时跳一次'
+    var o2 = document.createElement('option')
+    o2.value = 'working'
+    o2.textContent = '工作中每隔一段时间跳'
+    s.appendChild(o1)
+    s.appendChild(o2)
+    s.value = value === 'working' ? 'working' : 'turnEnd'
+    return s
+  }
+  // 默认折起的分组。刻意用原生 DOM + 内联样式,不用 <details>,免得和鲸鱼的样式/事件打架。
+  function collapsible(host, title) {
+    var wrap = mk('div', '', 'margin-top:10px;border-top:1px solid rgba(32,49,112,.12)')
+    var head = mk('div', '', 'display:flex;align-items:center;gap:6px;padding:7px 2px;cursor:pointer;'
+      + 'font-size:12px;color:#9fb0d9;user-select:none;text-align:left')
+    var arrow = textEl('span', '', '▸', 'font-size:11px')
+    head.appendChild(arrow)
+    head.appendChild(textEl('span', '', title, 'font-size:12px;color:#9fb0d9'))
+    var body = mk('div', '', '')
+    // 显式设 display 属性而不是塞进 cssText:两者在浏览器里等价,但这样状态是**可读的**
+    // (折叠逻辑自己也要读它,测试台也能据此断言"高级区默认是折起的")。
+    body.style.display = 'none'
+    head.addEventListener('click', function () {
+      var open = body.style.display !== 'none'
+      body.style.display = open ? 'none' : 'block'
+      setText(arrow, open ? '▸' : '▾')
+    })
+    wrap.appendChild(head)
+    wrap.appendChild(body)
+    host.appendChild(wrap)
+    return { wrap: wrap, head: head, body: body }
+  }
 
   // ======================== 设置卡片 ========================
   function topZ() {
@@ -257,14 +296,21 @@
       if (typeof window.dshwRegisterMask === 'function') unregister = window.dshwRegisterMask(mask)
     } catch (err) {}
 
-    // ---------- 1. 开关与区间 ----------
-    card.appendChild(secTitle('触发条件'))
+    // ---------- 1. 开关 / 模式 ----------
     var rOn = rowEl()
     C.enabled = checkBox(base.enabled !== false)
     rOn.appendChild(C.enabled)
     rOn.appendChild(labEl('启用受击提示'))
     card.appendChild(rOn)
 
+    var rMode = rowEl()
+    rMode.appendChild(labEl('模式'))
+    C.mode = modeSelect(base.mode)
+    rMode.appendChild(C.mode)
+    card.appendChild(rMode)
+
+    // ---------- 2. 跳动规则 ----------
+    card.appendChild(secTitle('跳动规则'))
     var rRange = rowEl()
     rRange.appendChild(labEl('区间'))
     C.minFen = numInput(fenOf(base.minAmount), { min: 0, step: 0.5, width: '56px', title: '低于这个消耗不会跳(单位:分)' })
@@ -281,7 +327,16 @@
     rP.appendChild(C.minPct)
     rP.appendChild(labEl('%   →  上限处 100%'))
     card.appendChild(rP)
-    card.appendChild(hintEl('区间内概率线性递增;低于下限不触发;达到/超过上限必定触发。上下限填成一样 = 纯阈值。'))
+
+    var rTick = rowEl()
+    rTick.appendChild(labEl('间隔'))
+    C.tickSec = numInput(base.tickSec != null ? base.tickSec : 5, { min: 0.5, max: 3600, step: 0.5, width: '60px', title: '「工作中每隔一段时间跳」的间隔秒数' })
+    rTick.appendChild(C.tickSec)
+    rTick.appendChild(labEl('秒(仅持续模式)'))
+    card.appendChild(rTick)
+
+    C.modeHint = hintEl('')
+    card.appendChild(C.modeHint)
 
     // ---------- 2. 概率曲线 ----------
     card.appendChild(secTitle('概率曲线'))
@@ -343,8 +398,28 @@
     }
     function xRound(v) { return isFinite(v) ? Math.round(v * 1e6) / 1e6 : 0 }
 
-    // ---------- 3. 预览与试算(不花一分钱) ----------
-    card.appendChild(secTitle('预览与试算(不发真实请求、不花钱)'))
+    // ---------- 3. 外观(基础) ----------
+    card.appendChild(secTitle('外观'))
+    var rLook = rowEl()
+    rLook.appendChild(labEl('字号'))
+    C.fontSizePx = numInput(base.fontSizePx, { min: 8, max: 200, step: 2, width: '56px' })
+    rLook.appendChild(C.fontSizePx)
+    rLook.appendChild(labEl('px　颜色'))
+    C.color = colorInput(base.color)
+    rLook.appendChild(C.color)
+    card.appendChild(rLook)
+
+    var rMotion = rowEl()
+    rMotion.appendChild(labEl('显示时长'))
+    C.riseMs = numInput(base.riseMs, { min: 200, max: 8000, step: 100, width: '66px', title: '整段动画的总时长;调大 = 飘得更慢、看得更久' })
+    rMotion.appendChild(C.riseMs)
+    rMotion.appendChild(labEl('ms　横向偏移'))
+    C.jitterPct = numInput(Math.round(Number(base.jitterX != null ? base.jitterX : 0.18) * 100), { min: 0, max: 100, step: 2, width: '56px', title: '每次跳动相对鲸鱼宽度的左右随机偏移幅度(%)' })
+    rMotion.appendChild(C.jitterPct)
+    rMotion.appendChild(labEl('%'))
+    card.appendChild(rMotion)
+
+    // ---------- 4. 预览(不花一分钱) ----------
     var rPrev = rowEl()
     C.btnLo = btn('预览下限', 'no', function () { hook.preview(yuanOf(C.minFen.value)) }, '在下限金额上直接飘一个,只看外观')
     C.btnMid = btn('预览中点', 'no', function () {
@@ -355,9 +430,67 @@
     rPrev.appendChild(C.btnMid)
     rPrev.appendChild(C.btnHi)
     card.appendChild(rPrev)
+    card.appendChild(hintEl('预览只在本机画一个数字:不发请求、不做判定、不花任何钱。'))
 
+    // ---------- 5. 高级(默认折起) ----------
+    var adv = collapsible(card, '高级(触发通道 · 描边 · 文本 · 试算)')
+
+    adv.body.appendChild(secTitle('触发通道'))
+    var rPush = rowEl()
+    C.pushEnabled = checkBox(base.pushEnabled !== false)
+    rPush.appendChild(C.pushEnabled)
+    rPush.appendChild(labEl('宿主推送即时触发'))
+    adv.body.appendChild(rPush)
+    adv.body.appendChild(hintEl('宿主在每轮结束的同一刻用 SSE 通知页面立刻取数(延迟几毫秒);关掉则退回下面的轮询。'))
+
+    var rMain = rowEl()
+    C.mainSessionOnly = checkBox(base.mainSessionOnly === true)
+    rMain.appendChild(C.mainSessionOnly)
+    rMain.appendChild(labEl('只对主会话生效'))
+    adv.body.appendChild(rMain)
+    adv.body.appendChild(hintEl('小鲸鱼的金额对任意会话的 turn/end 都会刷新(子代理也算)。勾上后子代理轮次不再即时触发,也不计入「工作中」。'))
+
+    var rPoll = rowEl()
+    rPoll.appendChild(labEl('兜底轮询'))
+    C.pollMs = numInput(base.pollMs != null ? base.pollMs : 2000, { min: 250, max: 60000, step: 250, width: '70px' })
+    rPoll.appendChild(C.pollMs)
+    rPoll.appendChild(labEl('ms'))
+    adv.body.appendChild(rPoll)
+
+    C.status = hintEl('')
+    adv.body.appendChild(C.status)
+
+    adv.body.appendChild(secTitle('描边与文本'))
+    var rStroke = rowEl()
+    rStroke.appendChild(labEl('描边'))
+    C.strokeWidth = numInput(base.strokeWidth, { min: 0, max: 12, step: 1, width: '44px', title: '描边宽度,0 = 无描边' })
+    rStroke.appendChild(C.strokeWidth)
+    rStroke.appendChild(labEl('px'))
+    C.strokeColor = colorInput(base.strokeColor, { title: '描边颜色(保证在任何背景上都看得清)' })
+    rStroke.appendChild(C.strokeColor)
+    adv.body.appendChild(rStroke)
+
+    var rTxt = rowEl()
+    rTxt.appendChild(labEl('前缀'))
+    C.prefix = textInput(base.prefix, { width: '56px', title: '金额前面的文字,例如 -¥' })
+    rTxt.appendChild(C.prefix)
+    rTxt.appendChild(labEl('小数位'))
+    C.decimals = numInput(base.decimals, { min: 0, max: 6, step: 1, width: '44px' })
+    rTxt.appendChild(C.decimals)
+    adv.body.appendChild(rTxt)
+
+    var rAdv2 = rowEl()
+    rAdv2.appendChild(labEl('上浮距离'))
+    C.risePx = numInput(base.risePx, { min: 0, max: 600, step: 8, width: '56px' })
+    rAdv2.appendChild(C.risePx)
+    rAdv2.appendChild(labEl('px　同屏上限'))
+    C.maxStack = numInput(base.maxStack, { min: 1, max: 20, step: 1, width: '44px' })
+    rAdv2.appendChild(C.maxStack)
+    adv.body.appendChild(rAdv2)
+
+    adv.body.appendChild(secTitle('试算(掷骰子,不花钱)'))
     var rSim = rowEl()
-    rSim.appendChild(labEl('试算'))
+    rSim.appendChild(labEl('金额'))
     C.simFen = numInput(fenOf((Number(base.minAmount) + Number(base.maxAmount)) / 2), { min: 0, step: 0.5, width: '56px', title: '要试算的消耗(分)' })
     rSim.appendChild(C.simFen)
     rSim.appendChild(labEl('分 ×'))
@@ -373,82 +506,9 @@
         setText(C.simOut, '试算失败:' + String((err && err.message) || err))
       }
     }, '按当前区间跑这么多次判定,看实测概率与理论值是否吻合'))
-    card.appendChild(rSim)
-    C.simOut = hintEl('点「跑」按当前区间掷骰子,验证概率 —— 不需要真的花钱。')
-    card.appendChild(C.simOut)
-
-    // ---------- 4. 触发通道 ----------
-    card.appendChild(secTitle('触发通道'))
-    var rPush = rowEl()
-    C.pushEnabled = checkBox(base.pushEnabled !== false)
-    rPush.appendChild(C.pushEnabled)
-    rPush.appendChild(labEl('宿主推送即时触发(推荐)'))
-    card.appendChild(rPush)
-    card.appendChild(hintEl('开启后,宿主在每轮结束的同一刻用 SSE 通知页面立刻取数,延迟约几毫秒;关闭则退回下面的轮询。'))
-
-    var rMain = rowEl()
-    C.mainSessionOnly = checkBox(base.mainSessionOnly === true)
-    rMain.appendChild(C.mainSessionOnly)
-    rMain.appendChild(labEl('只对主会话结算'))
-    card.appendChild(rMain)
-    card.appendChild(hintEl('注意:小鲸鱼的金额是「任意会话的 turn/end」都会刷新的,子代理也会。勾上后子代理轮次不再即时触发,但推送不可用而退回轮询时仍可能被兜底取到。'))
-
-    var rPoll = rowEl()
-    rPoll.appendChild(labEl('兜底轮询'))
-    C.pollMs = numInput(base.pollMs != null ? base.pollMs : 2000, { min: 250, max: 60000, step: 250, width: '70px' })
-    rPoll.appendChild(C.pollMs)
-    rPoll.appendChild(labEl('ms'))
-    card.appendChild(rPoll)
-
-    C.status = hintEl('')
-    card.appendChild(C.status)
-
-    // ---------- 5. 外观 ----------
-    card.appendChild(secTitle('外观'))
-    var rFont = rowEl()
-    rFont.appendChild(labEl('字号'))
-    C.fontSizePx = numInput(base.fontSizePx, { min: 8, max: 200, step: 2, width: '56px' })
-    rFont.appendChild(C.fontSizePx)
-    rFont.appendChild(labEl('px　　颜色'))
-    C.color = colorInput(base.color)
-    rFont.appendChild(C.color)
-    rFont.appendChild(labEl('描边'))
-    C.strokeColor = colorInput(base.strokeColor, { title: '描边颜色(保证在任何背景上都看得清)' })
-    rFont.appendChild(C.strokeColor)
-    C.strokeWidth = numInput(base.strokeWidth, { min: 0, max: 12, step: 1, width: '44px', title: '描边宽度,0 = 无描边' })
-    rFont.appendChild(C.strokeWidth)
-    rFont.appendChild(labEl('px'))
-    card.appendChild(rFont)
-
-    var rTxt = rowEl()
-    rTxt.appendChild(labEl('前缀'))
-    C.prefix = textInput(base.prefix, { width: '56px', title: '金额前面的文字,例如 -¥' })
-    rTxt.appendChild(C.prefix)
-    rTxt.appendChild(labEl('小数位'))
-    C.decimals = numInput(base.decimals, { min: 0, max: 6, step: 1, width: '44px' })
-    rTxt.appendChild(C.decimals)
-    card.appendChild(rTxt)
-
-    // ---------- 6. 动效 ----------
-    card.appendChild(secTitle('动效'))
-    var rAnim = rowEl()
-    rAnim.appendChild(labEl('上浮'))
-    C.risePx = numInput(base.risePx, { min: 0, max: 600, step: 8, width: '56px' })
-    rAnim.appendChild(C.risePx)
-    rAnim.appendChild(labEl('px　　时长'))
-    C.riseMs = numInput(base.riseMs, { min: 120, max: 6000, step: 100, width: '62px' })
-    rAnim.appendChild(C.riseMs)
-    rAnim.appendChild(labEl('ms'))
-    card.appendChild(rAnim)
-
-    var rAnim2 = rowEl()
-    rAnim2.appendChild(labEl('横向抖动'))
-    C.jitterX = numInput(base.jitterX, { min: 0, max: 1, step: 0.02, width: '56px', title: '相对鲸鱼宽度的比例,避免多次飘字完全重叠' })
-    rAnim2.appendChild(C.jitterX)
-    rAnim2.appendChild(labEl('　同屏上限'))
-    C.maxStack = numInput(base.maxStack, { min: 1, max: 20, step: 1, width: '44px' })
-    rAnim2.appendChild(C.maxStack)
-    card.appendChild(rAnim2)
+    adv.body.appendChild(rSim)
+    C.simOut = hintEl('')
+    adv.body.appendChild(C.simOut)
 
     // ---------- 底栏 ----------
     var btns = mk('div', 'dshwv-bubbtns')
@@ -460,10 +520,30 @@
     C.saveMsg = hintEl('')
     card.appendChild(C.saveMsg)
 
+    // 模式不同,规则说明与「间隔」是否可用都要跟着变(说明文字放这里,是为了让基础区一眼看懂当前模式)
+    function syncModeEnabled() {
+      var isWorking = C.mode.value === 'working'
+      C.tickSec.disabled = !isWorking
+      if (isWorking) {
+        var sec = Number(C.tickSec.value)
+        if (!isFinite(sec) || sec < 0.5) sec = 5
+        setText(C.modeHint, '对话进行期间每 ' + sec + ' 秒无条件跳一次,金额 = 上一轮的真实金额;'
+          + '每轮结束那一次仍按上面的区间概率判定。停在"工作中"只由宿主的活动状态决定。')
+      } else {
+        setText(C.modeHint, '每轮结束时按上面的区间概率跳一次:低于下限不跳,区间内概率线性递增,'
+          + '达到/超过上限必定跳。上下限填成一样 = 纯阈值。')
+      }
+    }
+    C.mode.addEventListener('change', syncModeEnabled)
+    C.tickSec.addEventListener('input', syncModeEnabled)
+    C.tickSec.addEventListener('change', syncModeEnabled)
+
     // ---------- 取值/回填 ----------
     function collect() {
       return {
         enabled: C.enabled.checked,
+        mode: C.mode.value,
+        tickSec: Number(C.tickSec.value),
         minFen: Number(C.minFen.value),
         maxFen: Number(C.maxFen.value),
         minPct: Number(C.minPct.value),
@@ -478,13 +558,15 @@
         fontSizePx: Number(C.fontSizePx.value),
         risePx: Number(C.risePx.value),
         riseMs: Number(C.riseMs.value),
-        jitterX: Number(C.jitterX.value),
+        jitterPct: Number(C.jitterPct.value),
         maxStack: Number(C.maxStack.value),
       }
     }
     function fill(c) {
       c = c || {}
       C.enabled.checked = c.enabled !== false
+      C.mode.value = c.mode === 'working' ? 'working' : 'turnEnd'
+      C.tickSec.value = String(c.tickSec != null ? c.tickSec : 5)
       C.minFen.value = String(fenOf(c.minAmount))
       C.maxFen.value = String(fenOf(c.maxAmount))
       C.minPct.value = String(Math.round(Number(c.minProbability) * 1000) / 10)
@@ -498,9 +580,10 @@
       C.strokeWidth.value = String(c.strokeWidth != null ? c.strokeWidth : 3)
       C.fontSizePx.value = String(c.fontSizePx != null ? c.fontSizePx : 30)
       C.risePx.value = String(c.risePx != null ? c.risePx : 96)
-      C.riseMs.value = String(c.riseMs != null ? c.riseMs : 1200)
-      C.jitterX.value = String(c.jitterX != null ? c.jitterX : 0.18)
+      C.riseMs.value = String(c.riseMs != null ? c.riseMs : 1800)
+      C.jitterPct.value = String(Math.round(Number(c.jitterX != null ? c.jitterX : 0.18) * 100))
       C.maxStack.value = String(c.maxStack != null ? c.maxStack : 6)
+      syncModeEnabled()
       redraw()
     }
 
@@ -512,8 +595,12 @@
         closeCard()
       }).catch(function (err) {
         C.ok.disabled = false
-        setText(C.saveMsg, '⚠ 保存失败:' + String((err && err.message) || err)
-          + '（宿主只接受本机回环的写请求;在局域网/反代地址下打开页面时保存会被拒）')
+        var msg = String((err && err.message) || err)
+        // 「宿主丢键」是版本不匹配,不是权限问题 —— 两种原因不能混成一句话,否则会把人带偏
+        if (!(err && err.droppedKeys)) {
+          msg += '(宿主只接受本机回环的写请求;在局域网/反代地址下打开页面时保存会被拒)'
+        }
+        setText(C.saveMsg, '⚠ 保存失败:' + msg)
       })
     }
 
@@ -526,8 +613,15 @@
         else if (rt.sseState === 'reconnecting') s = '推送:重连中(暂时靠轮询)'
         else if (rt.sseState === 'unsupported') s = '推送:浏览器不支持 EventSource(靠轮询)'
         else s = '推送:已关闭'
-        setText(C.status, s + '　·　兜底轮询 ' + rt.pollMs + 'ms　·　本次已触发 '
-          + rt.triggers + ' 次' + (rt.lastTrigger ? '(最近:' + rt.lastTrigger + ')' : ''))
+        if (rt.mode === 'working') {
+          // 持续模式下最要紧的自查:宿主到底认没认出"在干活",以及上一轮金额有没有拿到
+          s += '　·　工作中:' + (rt.working ? '是' : '否')
+            + '　·　间隔 ' + rt.tickSec + 's'
+            + '　·　上一轮金额 ' + (rt.lastKnownAmount === null ? '未知(先跑完一轮)' : fenText(rt.lastKnownAmount))
+        }
+        s += '　·　兜底轮询 ' + rt.pollMs + 'ms　·　本次已触发 ' + rt.triggers + ' 次'
+          + (rt.lastTrigger ? '(最近:' + rt.lastTrigger + ')' : '')
+        setText(C.status, s)
       } catch (err) { setText(C.status, '') }
     }
 

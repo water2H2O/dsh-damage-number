@@ -31,13 +31,21 @@
   var ENDPOINT_TURN = '/dsh-whale/last-turn.json'
   var ENDPOINT_CFG = '/dsh-dmg/config.json'
   var ENDPOINT_EVENTS = '/dsh-dmg/events'
+  var ENDPOINT_ACTIVITY = '/dsh-dmg/activity.json'
   var CFG_REFRESH_MS = 30000
+  // 「现在有没有在干活」的可信来源。3 秒一次、请求体极小;SSE 的 activity 帧只是让它反应更快,
+  // 这样即使某帧丢了或 SSE 压根没连上,也不会一直以为"还在干活"而空跳。
+  var ACTIVITY_POLL_MS = 3000
+  // 持续跳动的监督器节拍:每 500ms 看一次是否该跳,间隔改了也能立刻跟上,不用重建定时器
+  var TICK_CHECK_MS = 500
   var LAYER_ID = 'dsh-dmg-layer'
   var MIN_POLL_MS = 250
   var MAX_POLL_MS = 60000
 
   var DEFAULT_CFG = {
     enabled: true,
+    mode: 'turnEnd',
+    tickSec: 5,
     minAmount: 0.01,
     maxAmount: 0.1,
     minProbability: 0.25,
@@ -51,7 +59,7 @@
     strokeWidth: 3,
     fontSizePx: 30,
     risePx: 96,
-    riseMs: 1200,
+    riseMs: 1800,
     headOffsetX: 0.5,
     headOffsetY: 0.12,
     jitterX: 0.18,
@@ -72,6 +80,18 @@
   var curPollMs = 0
   var configWatchers = []
   var runtime = { lastTickAt: 0, lastTrigger: '', triggers: 0, sseState: 'off' }
+
+  // ---- 「工作中持续跳动」的状态 ----
+  // working 的可信来源是 /dsh-dmg/activity.json(3 秒一次);SSE 的 activity 帧让它反应更快。
+  var working = false
+  var workingSince = null
+  var activityTimer = null
+  var supervisorTimer = null
+  var lastBurstAt = 0
+  // 上一次**已完成**那一轮的真实金额。「工作中持续跳动」用的就是它 ——
+  // 小鲸鱼没有暴露"本轮进行中的金额",所以这里刻意不做任何估算:宁可重复同一个真实数字,
+  // 也不显示一个编出来的数。(页面刚打开、还没读到过任何金额时,先不跳。)
+  var lastKnownAmount = null
 
   function readStoredSeq() {
     try {
@@ -227,11 +247,20 @@
       try { if (outer.parentNode) outer.parentNode.removeChild(outer) } catch (err) {}
     }
 
+    // 关键帧(全部用 px,不与 % 混插):
+    //   0.00 → 0.10  弹出(缩放过冲)
+    //   0.10 → 0.28  落定
+    //   0.28 → 0.78  **主可见段**:近乎匀速地缓慢上浮,占总时长的一半
+    //   0.78 → 1.00  只负责淡出,几乎不再位移
+    // 之所以这么分:用户反馈旧版"滑动太快、显示时间太短"。旧版把 0.68 的时长用来走 0.66 的距离
+    // (≈78px/s),可见窗口只有约 0.7 个时长;现在可见窗口占 0.9 个时长,上浮速度 ≈58px/s。
+    // 想整体更慢/更久,只需要调大 riseMs —— 也就是面板里的「时长」。
     var frames = [
-      { transform: 'translateY(0px) scale(.55)', opacity: 0 },
-      { transform: 'translateY(' + (-dist * 0.16).toFixed(1) + 'px) scale(1.28)', opacity: 1, offset: 0.16 },
-      { transform: 'translateY(' + (-dist * 0.34).toFixed(1) + 'px) scale(1)', opacity: 1, offset: 0.32 },
-      { transform: 'translateY(' + (-dist).toFixed(1) + 'px) scale(1.04)', opacity: 0 },
+      { transform: 'translateY(0px) scale(.55)', opacity: 0, offset: 0 },
+      { transform: 'translateY(' + (-dist * 0.12).toFixed(1) + 'px) scale(1.28)', opacity: 1, offset: 0.10 },
+      { transform: 'translateY(' + (-dist * 0.34).toFixed(1) + 'px) scale(1)', opacity: 1, offset: 0.28 },
+      { transform: 'translateY(' + (-dist * 0.88).toFixed(1) + 'px) scale(1)', opacity: 1, offset: 0.78 },
+      { transform: 'translateY(' + (-dist).toFixed(1) + 'px) scale(1.04)', opacity: 0, offset: 1 },
     ]
     var timing = { duration: dur, easing: 'cubic-bezier(.22,.61,.36,1)', fill: 'forwards' }
 
@@ -270,6 +299,9 @@
     hook.cfg = cfg
     syncPoll()
     syncPush()
+    // 模式/间隔/总开关都可能刚变过:让监督器与活动轮询跟着启停
+    syncSupervisor()
+    syncActivityPoll()
     notifyConfig()
     return cfg
   }
@@ -287,18 +319,34 @@
 
   // 面板保存:写到宿主(宿主只接受本机回环的写请求),成功后立刻在本地生效
   function saveConfig(patch) {
+    var sent = Object.assign({}, cfg, patch || {})
     return fetch(ENDPOINT_CFG, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
       cache: 'no-store',
-      body: JSON.stringify(Object.assign({}, cfg, patch || {})),
+      body: JSON.stringify(sent),
     }).then(function (r) {
       if (!r || !r.ok) throw new Error('HTTP ' + (r && r.status))
       return r.json()
     }).then(function (d) {
       if (!d || d.ok !== true) throw new Error((d && d.error) || '保存被拒绝')
       applyConfig(d.config)
+      // 宿主可能还没加载新版本:它的 sanitize() 只认**自己那份** DEFAULT_CONFIG 里的键,
+      // 遇到不认识的键会静默丢掉 —— 表现就是"点了保存、卡片关了、设置却没变",极难排查。
+      // 所以把发出去的每个键跟回来的值逐个比一遍,对不上就明确报错(浏览器半区可以先于宿主半区更新)。
+      var got = d.config || {}
+      var dropped = []
+      for (var k in sent) {
+        if (!Object.prototype.hasOwnProperty.call(sent, k)) continue
+        if (JSON.stringify(got[k]) !== JSON.stringify(sent[k])) dropped.push(k)
+      }
+      if (dropped.length) {
+        var e = new Error('宿主没接受这些键:' + dropped.join('、')
+          + '(宿主半区还是旧版本 —— 重启一次客户端后再保存)')
+        e.droppedKeys = dropped
+        throw e
+      }
       return d.config
     })
   }
@@ -310,6 +358,14 @@
       .then(function (d) {
         if (!d || !d.ok || typeof d.seq !== 'number') return null
         var seq = num(d.seq, 0)
+
+        // 先记"最近一轮的真实金额" —— 「工作中持续跳动」用的就是它。
+        // 必须放在下面所有提前 return **之前**:页面刚打开那一次只立基准就 return 了,
+        // 如果记录写在后面,持续模式会一直因为"读不到金额"而空等一整轮。
+        if (d.amount !== null && d.amount !== undefined) {
+          var known = num(d.amount, NaN)
+          if (isFinite(known) && known >= 0) lastKnownAmount = known
+        }
 
         if (baseline === null) {
           var stored = readStoredSeq()
@@ -357,6 +413,102 @@
     timers.push(pollTimer)
   }
 
+  function wantWorkingMode() {
+    return cfg.enabled !== false && cfg.mode === 'working'
+  }
+
+  function tickSecMs() {
+    var n = num(cfg.tickSec, 5)
+    if (!isFinite(n)) n = 5
+    if (n < 0.5) n = 0.5
+    if (n > 3600) n = 3600
+    return Math.round(n * 1000)
+  }
+
+  // 工作中间隔跳动:无条件跳(不做概率判定),金额 = 上一轮的真实金额。
+  // 之所以不做概率判定:用户要的就是"只要在干活就一直在输出";概率那一层留给每轮结束那一次
+  // (那条路径仍走 rollDamage,所以「区间/概率」这些设置依然有意义)。
+  function burstTick() {
+    if (!wantWorkingMode()) return false
+    if (lastKnownAmount === null) return false   // 还没读到过任何真实金额 → 宁可不跳,也不编一个
+    runtime.triggers++
+    runtime.lastTrigger = 'working'
+    spawn(lastKnownAmount)
+    return true
+  }
+
+  // 该不该来一次间隔跳动。做成纯判断(定时器只是每 TICK_CHECK_MS 调它一次)有三个好处:
+  //   · 面板里改间隔/模式立刻生效,不需要重建定时器;
+  //   · 它可以直接被测试断言,不用去驱动定时器;
+  //   · "什么时候**不**跳"的规则集中在一处,不会散落在回调里。
+  function shouldBurst(now) {
+    if (cfg.enabled === false) return false
+    if (cfg.mode !== 'working') return false
+    if (!working) return false
+    if (lastKnownAmount === null) return false   // 还没读到过任何真实金额 → 宁可不跳,也不编一个
+    if (!lastBurstAt) return false
+    return (num(now, Date.now()) - lastBurstAt) >= tickSecMs()
+  }
+
+  // 监督器:每 TICK_CHECK_MS 问一次 shouldBurst
+  function syncSupervisor() {
+    var want = wantWorkingMode()
+    if (!want) {
+      if (supervisorTimer) { clearInterval(supervisorTimer); supervisorTimer = null }
+      lastBurstAt = 0
+      return
+    }
+    if (supervisorTimer) return
+    supervisorTimer = setInterval(function () {
+      var now = Date.now()
+      if (!shouldBurst(now)) return
+      lastBurstAt = now
+      burstTick()
+    }, TICK_CHECK_MS)
+    timers.push(supervisorTimer)
+  }
+
+  function setWorking(next) {
+    var was = working
+    working = !!next
+    if (working && !was) {
+      workingSince = Date.now()
+      lastBurstAt = Date.now()   // 第一跳从"开始工作"起算一个完整间隔,不立刻喷一个
+    }
+    if (!working && was) {
+      workingSince = null
+      lastBurstAt = 0
+    }
+    syncSupervisor()
+  }
+
+  // ---- 活动状态(「工作中持续跳动」的依据)----
+  function syncActivity() {
+    if (!wantWorkingMode()) return Promise.resolve(null)
+    return fetchJson(ENDPOINT_ACTIVITY)
+      .then(function (d) {
+        if (!d || d.ok !== true) return null
+        // 「只在主会话」时,子代理在跑不算"我在干活"
+        var busy = cfg.mainSessionOnly === true ? !!d.mainWorking : !!d.working
+        setWorking(busy)
+        return d
+      })
+      .catch(function () { return null })
+  }
+
+  function syncActivityPoll() {
+    // 只有开着持续模式才需要它;不关心就一个请求都不发
+    if (!wantWorkingMode()) {
+      if (activityTimer) { clearInterval(activityTimer); activityTimer = null }
+      setWorking(false)
+      return
+    }
+    if (activityTimer) return
+    activityTimer = setInterval(function () { syncActivity() }, ACTIVITY_POLL_MS)
+    timers.push(activityTimer)
+    syncActivity()   // 立刻收敛一次:别让刚切到持续模式后白等一个轮询周期
+  }
+
   // ---- SSE:宿主在 turn/end 的同一刻叫醒我们 ----
   function stopPush() {
     if (es) {
@@ -386,6 +538,13 @@
       esReady = true
       runtime.sseState = 'ready'
     })
+    // 活动状态帧:只让"开始/结束工作"反应更快;可信来源仍是 activity.json 的 3 秒轮询
+    es.addEventListener('activity', function (ev) {
+      var d = null
+      try { d = JSON.parse(ev.data) } catch (err) { d = null }
+      if (!d) return
+      setWorking(cfg.mainSessionOnly === true ? !!d.mainWorking : !!d.working)
+    })
     es.addEventListener('turn', function (ev) {
       var d = null
       try { d = JSON.parse(ev.data) } catch (err) { d = null }
@@ -398,6 +557,7 @@
       esReady = true
       runtime.sseState = 'ready'
       tick('push-open')
+      syncActivity()
     }
     es.onerror = function () {
       // EventSource 自己会重连;这里只标记状态,让面板能显示"已降级为轮询"
@@ -426,7 +586,7 @@
   }
 
   var hook = {
-    version: '0.2.1',
+    version: '0.3.0',
     DEFAULT_CFG: DEFAULT_CFG,
     getConfig: function () { return Object.assign({}, cfg) },
     setConfig: function (patch) { return applyConfig(Object.assign({}, cfg, patch || {})) },
@@ -446,7 +606,10 @@
     preview: preview,
     simulate: simulate,
     tick: tick,
+    burstTick: burstTick,          // 立刻手动来一次"工作中间隔跳动"(便于测试与试看)
+    shouldBurst: shouldBurst,      // 该不该跳的纯判断(测试用,不必驱动定时器)
     headPoint: headPoint,
+    syncActivity: syncActivity,    // 立刻刷新一次"是否在干活"
     reset: function () { baseline = null; return true },
     clearStoredSeq: function () { try { window.localStorage.removeItem(SEQ_KEY) } catch (err) {} baseline = null; return true },
     getBaseline: function () { return baseline },
@@ -460,6 +623,14 @@
         lastTrigger: runtime.lastTrigger,
         baseline: baseline,
         onScreen: stack.length,
+        mode: cfg.mode === 'working' ? 'working' : 'turnEnd',
+        tickSec: num(cfg.tickSec, 5),
+        working: working,
+        workingSince: workingSince,
+        lastBurstAt: lastBurstAt,
+        lastKnownAmount: lastKnownAmount,
+        supervisorOn: !!supervisorTimer,
+        activityPollOn: !!activityTimer,
       }
     },
     cfg: cfg,
@@ -472,6 +643,9 @@
       tick('boot')
       syncPoll()
       syncPush()
+      syncSupervisor()
+      syncActivityPoll()
+      syncActivity()
       timers.push(setInterval(loadConfig, CFG_REFRESH_MS))
     })
   }

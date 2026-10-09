@@ -98,6 +98,11 @@ function makeHarness(opts) {
     cfg: null,
     cfgFail: false,
     whalePresent: true,
+    activity: { ok: true, working: false, mainWorking: false, since: null, sessions: 0 },
+    activityFail: false,
+    activityCalls: 0,
+    puts: [],
+    stripKeys: null,
   }
 
   const body = makeEl('body')
@@ -132,20 +137,41 @@ function makeHarness(opts) {
     window: { innerWidth: 1200, innerHeight: 800, localStorage: storage },
     localStorage: storage,
     console,
-    fetch: async (url) => {
+    fetch: async (url, o) => {
       const u = String(url)
+      const method = (o && o.method) || 'GET'
       if (u.indexOf('/dsh-whale/last-turn.json') >= 0) {
         if (state.turnFail) return { ok: false, status: 500, json: async () => null }
         return { ok: true, status: 200, json: async () => state.turn }
       }
       if (u.indexOf('/dsh-dmg/config.json') >= 0) {
+        if (method === 'PUT') {
+          let body = null
+          try { body = JSON.parse(o.body) } catch (err) {}
+          state.puts.push(body)
+          // 模拟"旧宿主的 sanitize() 不认识某些键" → 静默丢掉它们
+          let stored = body
+          if (state.stripKeys && state.stripKeys.length) {
+            stored = Object.assign({}, body)
+            for (const k of state.stripKeys) delete stored[k]
+          }
+          state.cfg = stored
+          return { ok: true, status: 200, json: async () => ({ ok: true, config: stored, file: 'x' }) }
+        }
         if (state.cfgFail) return { ok: false, status: 404, json: async () => null }
         return { ok: true, status: 200, json: async () => state.cfg }
+      }
+      if (u.indexOf('/dsh-dmg/activity.json') >= 0) {
+        if (state.activityFail) return { ok: false, status: 404, json: async () => null }
+        state.activityCalls++
+        return { ok: true, status: 200, json: async () => state.activity }
       }
       return { ok: false, status: 404, json: async () => null }
     },
     setInterval(fn, ms) { return 1 },
     setTimeout(fn, ms) { return 1 },
+    clearInterval() {},
+    clearTimeout() {},
   }
 
   const ctx = vm.createContext(sandbox)
@@ -280,15 +306,31 @@ async function main() {
   section('11. 动效关键帧与清理')
   const anim = n1.children[0].__anim
   ok(!!anim, '使用了 Web Animations API(inner.animate)')
-  eq(anim.frames.length, 4, '4 段关键帧(弹出 → 过冲 → 落定 → 上浮淡出)')
+  const tyOf = (f) => {
+    const m = /translateY\((-?[\d.]+)px\)/.exec(String(f.transform))
+    return m ? parseFloat(m[1]) : NaN
+  }
+  eq(anim.frames.length, 5, '5 段关键帧(弹出 → 过冲 → 落定 → 缓慢上浮 → 淡出)')
   eq(anim.frames[0].opacity, 0, '起始透明')
   eq(anim.frames[1].opacity, 1, '过冲帧已不透明')
   ok(String(anim.frames[1].transform).indexOf('scale(1.28)') >= 0, '过冲缩放 1.28(弹出感)')
-  eq(anim.frames[3].opacity, 0, '末帧淡出为 0')
-  ok(String(anim.frames[3].transform).indexOf('translateY(-96.0px)') >= 0, '末帧上浮 96px')
-  ok(String(anim.frames[3].transform).indexOf('%') < 0, '关键帧只用 px(不与百分比混插)')
-  eq(anim.timing.duration, 1200, '时长 1200ms')
+  eq(anim.frames[4].opacity, 0, '末帧淡出为 0')
+  ok(String(anim.frames[4].transform).indexOf('translateY(-96.0px)') >= 0, '末帧停在完整上浮距离上')
+  ok(String(anim.frames[4].transform).indexOf('%') < 0, '关键帧只用 px(不与百分比混插)')
+  eq(anim.timing.duration, 1800, '默认时长 1800ms')
   eq(anim.timing.fill, 'forwards', 'fill:forwards')
+
+  // ——「滑动太快 / 显示时间太短」的回归守卫 ——
+  // 旧版:可见窗口只有约 0.7 个时长,主段速度 ≈78px/s。这三条把它钉住,防止再改回去。
+  eq(anim.frames[3].opacity, 1, '倒数第二帧仍然完全可见')
+  const holdSpan = anim.frames[3].offset - anim.frames[2].offset
+  ok(holdSpan >= 0.45, '主可见段至少占时长的 45%', 'span=' + holdSpan)
+  const visibleSpan = anim.frames[3].offset - anim.frames[1].offset
+  ok(visibleSpan >= 0.65, '完全不透明的时间窗 ≥ 时长的 65%', 'span=' + visibleSpan)
+  const driftPx = Math.abs(tyOf(anim.frames[3])) - Math.abs(tyOf(anim.frames[2]))
+  const driftMs = holdSpan * anim.timing.duration
+  const speed = driftPx / driftMs * 1000
+  ok(speed < 70, '主可见段上浮速度 < 70px/s(慢于旧版 ≈78px/s)', speed.toFixed(1) + 'px/s')
 
   const layerNow = H.layer()
   const before = layerNow.children.length
@@ -457,6 +499,95 @@ async function main() {
   eq(S4.hook.getRuntime().sseState, 'unsupported', '没有 EventSource → 标记 unsupported')
   eq(S4.hook.getRuntime().pollMs, 2000, '兜底轮询照常存在(默认 2000ms)')
 
+  section('22b. 持续模式(mode=working):工作期间按间隔无条件跳动')
+  const E5 = makeEventSourceStub()
+  const W = makeHarness({ eventSource: E5 })
+  W.state.turn = { ok: true, seq: 3, amount: 0.07, tokens: 1, ts: 1 }
+  await flush(); await flush()
+  eq(W.hook.getRuntime().lastKnownAmount, 0.07, '启动读数就记住了上一轮的真实金额')
+  eq(W.hook.getRuntime().mode, 'turnEnd', '默认仍是「每轮结束时」')
+  eq(W.hook.getRuntime().supervisorOn, false, '默认模式下不启动监督器')
+  eq(W.hook.getRuntime().activityPollOn, false, '默认模式下不发活动轮询(零多余请求)')
+  eq(W.state.activityCalls, 0, '默认模式下确实一个 activity 请求都没发')
+
+  W.hook.setConfig({ mode: 'working', tickSec: 5 })
+  eq(W.hook.getRuntime().mode, 'working', '已切到持续模式')
+  eq(W.hook.getRuntime().supervisorOn, true, '监督器启动')
+  eq(W.hook.getRuntime().activityPollOn, true, '活动轮询启动')
+  eq(W.hook.getRuntime().lastBurstAt, 0, '还没在干活 → 不开始计时')
+  eq(W.hook.shouldBurst(Date.now() + 999999), false, '没在干活时再久也不跳')
+
+  W.state.activity = { ok: true, working: true, mainWorking: true, since: 1, sessions: 1 }
+  await W.hook.syncActivity()
+  const w0 = W.hook.getRuntime()
+  eq(w0.working, true, '读到 working=true')
+  ok(w0.lastBurstAt > 0, '开始干活时记下起跳时刻')
+  eq(W.hook.shouldBurst(w0.lastBurstAt + 1000), false, '不到间隔(5s)不跳')
+  eq(W.hook.shouldBurst(w0.lastBurstAt + 4999), false, '差 1ms 也还不跳')
+  eq(W.hook.shouldBurst(w0.lastBurstAt + 5000), true, '满 5 秒该跳')
+
+  const beforeW = W.layer().children.length
+  eq(W.hook.burstTick(), true, 'burstTick 无条件跳一次(不做概率判定)')
+  eq(W.layer().children.length, beforeW + 1, '生成了节点')
+  eq(W.hook.getRuntime().lastTrigger, 'working', '触发来源标记为 working')
+  const wNode = W.layer().children[W.layer().children.length - 1]
+  eq(wNode.children[0].textContent, '-¥0.07', '数字 = 上一轮真实金额(原样重复,零估算)')
+
+  W.state.activity = { ok: true, working: false, mainWorking: false, since: null, sessions: 0 }
+  await W.hook.syncActivity()
+  eq(W.hook.getRuntime().working, false, '读到 working=false')
+  eq(W.hook.shouldBurst(Date.now() + 999999), false, '停止干活后不再跳')
+
+  W.hook.setConfig({ mainSessionOnly: true })
+  W.state.activity = { ok: true, working: true, mainWorking: false, since: 1, sessions: 1 }
+  await W.hook.syncActivity()
+  eq(W.hook.getRuntime().working, false, '「仅主会话」时只有子代理在跑 → 不算我在干活')
+  W.state.activity = { ok: true, working: true, mainWorking: true, since: 1, sessions: 2 }
+  await W.hook.syncActivity()
+  eq(W.hook.getRuntime().working, true, '主会话也在跑 → 照常跳')
+
+  section('22c. 持续模式:读不到金额时宁可不跳,也不编数字')
+  const W2 = makeHarness()
+  await flush(); await flush()
+  eq(W2.hook.getRuntime().lastKnownAmount, null, '此前没读到过任何金额')
+  W2.hook.setConfig({ mode: 'working' })
+  eq(W2.hook.burstTick(), false, '没有已知金额 → burstTick 拒绝')
+  eq(W2.layer().children.length, 0, '也确实没有生成任何节点')
+
+  section('22d. 持续模式:关掉总开关就彻底安静')
+  const W3 = makeHarness({ eventSource: makeEventSourceStub() })
+  W3.state.turn = { ok: true, seq: 9, amount: 0.2, tokens: 1, ts: 1 }
+  await flush(); await flush()
+  W3.hook.setConfig({ mode: 'working' })
+  await W3.hook.syncActivity()
+  eq(W3.hook.getRuntime().supervisorOn, true, '开着时监督器在跑')
+  W3.hook.setConfig({ enabled: false })
+  eq(W3.hook.getRuntime().supervisorOn, false, '总开关关掉 → 监督器停')
+  eq(W3.hook.getRuntime().activityPollOn, false, '活动轮询也停')
+  eq(W3.hook.burstTick(), false, '总开关关掉后 burstTick 也不跳')
+  W3.hook.setConfig({ enabled: true, mode: 'turnEnd' })
+  eq(W3.hook.getRuntime().supervisorOn, false, '切回「每轮结束时」→ 监督器同样停')
+
+  section('22e. 保存时检测"宿主把键丢掉了"(版本不匹配不能被静默吞掉)')
+  const S7 = makeHarness()
+  await flush(); await flush()
+  S7.state.stripKeys = ['mode', 'tickSec']   // 模拟旧宿主:sanitize() 不认识这两个键
+  let dropErr = null
+  try {
+    await S7.hook.saveConfig({ mode: 'working', tickSec: 3 })
+  } catch (err) { dropErr = err }
+  ok(!!dropErr, '抛错,而不是"看起来保存成功"')
+  eq(JSON.stringify(dropErr && dropErr.droppedKeys), JSON.stringify(['mode', 'tickSec']),
+    '明确点名被丢掉的键')
+  ok(String(dropErr && dropErr.message).indexOf('重启') >= 0, '错误信息给出可操作的指引')
+
+  S7.state.stripKeys = null
+  let okErr = null
+  try { await S7.hook.saveConfig({ mode: 'working', tickSec: 3 }) } catch (err) { okErr = err }
+  eq(okErr, null, '宿主正常接受时不再报错')
+  eq(S7.hook.getConfig().mode, 'working', '并且真的生效了')
+  eq(S7.hook.getConfig().tickSec, 3, '间隔也生效了')
+
   // ==========================================================================
   // 宿主半区:真实加载 lib/index.js 并跑一遍 apply(),验证路由注册与 SSE 广播。
   // 这是"消耗几毫秒就到"那条链路里**宿主侧**的全部关键行为。
@@ -494,9 +625,9 @@ async function main() {
   await hostPlugin.apply(fakeRoot)
   const paths = routes.map((r) => r.path).sort()
   eq(JSON.stringify(paths), JSON.stringify([
-    '/dsh-dmg/config.json', '/dsh-dmg/events', '/dsh-dmg/overlay.js',
-    '/dsh-dmg/panel.js', '/dsh-dmg/status.json',
-  ]), 'apply() 注册了全部 5 条路由')
+    '/dsh-dmg/activity.json', '/dsh-dmg/config.json', '/dsh-dmg/events',
+    '/dsh-dmg/overlay.js', '/dsh-dmg/panel.js', '/dsh-dmg/status.json',
+  ]), 'apply() 注册了全部 6 条路由')
   eq((listeners['session/event'] || []).length, 1, '订阅了 session/event(turn/end 即时推送的来源)')
   eq((listeners['webserver/index-inject'] || []).length, 1, '订阅了 webserver/index-inject(桌面端注入通道)')
   eq(taps.length, 1, '注册了 tapIndex(web 形态注入)')
@@ -551,9 +682,66 @@ async function main() {
 
   sse.frames.length = 0
   fire({ id: 's3', header: { parentSession: 'p' } }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
-  eq(sse.frames.join(''), '', 'mainSessionOnly=true 后子代理轮次不再广播')
+  ok(sse.frames.join('').indexOf('event: turn') < 0, 'mainSessionOnly=true 后子代理轮次不再广播 turn 帧')
+  ok(sse.frames.join('').indexOf('event: activity') >= 0,
+    '但活动状态帧照常广播(它不受会话过滤影响:子代理在跑也是"在干活")')
+  sse.frames.length = 0
   fire({ id: 's4', header: {} }, { type: 'turn/end', data: { turn: 4, reason: { kind: 'completed' } } })
   ok(sse.frames.join('').indexOf('event: turn') >= 0, '主会话仍然照常广播')
+
+  section('26b. 宿主半区:活动状态(turn/start → working)')
+  const actRoute = routes.filter((r) => r.path === '/dsh-dmg/activity.json')[0]
+  const readActivity = async () => {
+    const r = mkRes()
+    let body = ''
+    r.end = (s) => { body = String(s || ''); r.ended = true }
+    await actRoute.handler({ method: 'GET', headers: { host: '127.0.0.1:3080' }, on() {} }, r)
+    return JSON.parse(body)
+  }
+  eq((listeners['session/disposed'] || []).length, 1, '订阅了 session/disposed(防止永远卡在"工作中")')
+  let act = await readActivity()
+  eq(act.ok, true, 'activity.json 可用')
+  eq(act.working, false, '初始没有轮次在跑')
+
+  sse.frames.length = 0
+  fire({ id: 'm1', header: {} }, { type: 'turn/start', data: { turn: 7 } })
+  ok(sse.frames.join('').indexOf('event: activity') >= 0, 'turn/start 立刻推 activity 帧')
+  act = await readActivity()
+  eq(act.working, true, 'turn/start 后 working=true')
+  eq(act.mainWorking, true, '主会话在跑 → mainWorking=true')
+  eq(act.sessions, 1, '1 个会话在跑')
+
+  fire({ id: 's1', header: { origin: 'subagent' } }, { type: 'turn/start', data: { turn: 1 } })
+  act = await readActivity()
+  eq(act.sessions, 2, '子代理也在跑 → 2 个会话')
+  eq(act.mainWorking, true, 'mainWorking 仍为 true')
+
+  fire({ id: 'm1', header: {} }, { type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } })
+  act = await readActivity()
+  eq(act.working, true, '主会话结束了但子代理还在 → working 仍为 true')
+  eq(act.mainWorking, false, '主会话已结束 → mainWorking=false(「仅主会话」据此停跳)')
+
+  const disposed = (s) => { for (const fn of listeners['session/disposed']) fn(s) }
+  disposed({ id: 's1', header: { origin: 'subagent' } })
+  act = await readActivity()
+  eq(act.working, false, '会话被销毁也会摘掉,不会永远卡在"工作中"')
+  eq(act.sessions, 0, '已清空')
+
+  fire({ id: 'm2', header: {} }, { type: 'turn/start', data: { turn: 1 } })
+  fire({ id: 'm2', header: {} }, { type: 'turn/start', data: { turn: 2 } })
+  act = await readActivity()
+  eq(act.sessions, 1, '同一会话连续 turn/start 不会重复计数')
+  fire({ id: 'm2', header: {} }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+  act = await readActivity()
+  eq(act.working, false, '结束即清零')
+
+  const statusRoute = routes.filter((r) => r.path === '/dsh-dmg/status.json')[0]
+  const sr = mkRes()
+  let sbody = ''
+  sr.end = (s) => { sbody = String(s || '') }
+  await statusRoute.handler({ method: 'GET', headers: { host: '127.0.0.1:3080' }, on() {} }, sr)
+  const sj = JSON.parse(sbody)
+  ok(sj.activity && typeof sj.activity.working === 'boolean', 'status.json 也带上了活动状态')
 
   section('27. 宿主半区:信任栅栏的四种情形(与 dsh-whale-widget 同款语义)')
   // 设计要点:宿主栅栏**可用**时,非回环 Host 交给它判 —— 它才知道 dsh 自己的 --trusted-host
