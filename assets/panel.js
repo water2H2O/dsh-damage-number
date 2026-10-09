@@ -30,7 +30,7 @@
   var ENTRY_ID = 'dsh-dmg-entry'
   var PANEL_TITLE = '受击提示设置'
   var WHALE_TITLE_HINT = '提示与音效'   // 用来认出鲸鱼那一个面板
-  var MAX_WAIT_TRIES = 200              // 50ms × 200 = 10s:等 overlay.js 就绪
+  // 等 overlay.js 就绪:不再有"最大等待次数" —— 见 whenReady() 里的说明,放弃就等于面板永久失效。
 
   var hook = null
   var entryRow = null
@@ -475,6 +475,7 @@
   var scanScheduled = false
   var scanCount = 0
   var panelSeen = false   // 鲸鱼面板是否出现过:只在"曾经在、现在没了"时才自动收起我们的卡片
+  var moRef = null        // MutationObserver 的强引用(保活,见 watch())
 
   function nodeHasPanel(n) {
     try {
@@ -514,8 +515,7 @@
   function watch() {
     try {
       if (typeof window.MutationObserver === 'function') {
-        var mo = new window.MutationObserver(function (records) {
-          var relevant = false
+        var mo = new window.MutationObserver(function (records) {          var relevant = false
           try {
             var recs = records || []
             for (var i = 0; i < recs.length && !relevant; i++) {
@@ -529,6 +529,7 @@
           } catch (err) { relevant = true }   // 判断本身出错时宁可多扫一次,也不要漏掉面板
           if (relevant) scheduleScan()
         })
+        moRef = mo   // 强引用保活:MutationObserver 一旦丢掉 JS 引用,某些实现/GC 时机会停止派发
         mo.observe(document.body || document.documentElement, { childList: true, subtree: true })
       }
     } catch (err) {}
@@ -558,8 +559,25 @@
       watch()
       return
     }
-    if ((tries || 0) > MAX_WAIT_TRIES) return
-    setTimeout(function () { whenReady((tries || 0) + 1) }, 50)
+    // ⚠️ 这里**绝不能放弃**。
+    // panel.js 与 overlay.js 是两个各自 <script src> 的独立文件,执行顺序不保证;
+    // 而入口行、设置卡片全都依赖 overlay 暴露的 window.__dshDmgNumber。
+    // 旧实现"等 10 秒就 return"→ 一旦 overlay 慢了或压根没加载成功,面板就**永久失效**,
+    // 而且一声不吭 —— 现象正是"点开全局设置什么都没有",极难排查。
+    // 现在:一直重试(逐步放慢),并在等不到时把原因明确打到控制台。
+    var n = tries || 0
+    if (n === 60 && !whenReady.warned) {   // ≈3 秒还没等到
+      whenReady.warned = true
+      try {
+        console.warn('[dsh-damage-number] 还没等到 overlay.js 的 window.__dshDmgNumber,'
+          + '设置入口行暂时挂不上。排查顺序:'
+          + '① 硬刷新页面(Ctrl+F5);'
+          + '② 刷新后在 Network 里看 /dsh-dmg/overlay.js 的状态码(若是 500/404,是宿主侧没读到这个文件);'
+          + '③ 在 Console 里输入 window.__dshDmgNumber 看是否 undefined。')
+      } catch (err) {}
+    }
+    var delay = n < 40 ? 50 : (n < 200 ? 250 : 2000)   // 逐步放慢,但永不放弃
+    setTimeout(function () { whenReady(n + 1) }, delay)
   }
 
   whenReady(0)

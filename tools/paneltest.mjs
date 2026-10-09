@@ -220,9 +220,41 @@ function makeSandbox(opts) {
     getComputedStyle(el) { return { zIndex: (el && el.style && el.style.zIndex) || 'auto' } },
   }
 
+  // ---- 虚拟时钟 ----
+  // 专门为了验证「panel.js 等不到 overlay 时会不会放弃」:旧实现等 10 秒就 return,
+  // 面板从此永久失效且一声不吭。有了可控时钟,测试可以把时间推过那个点再看它还认不认。
+  const clock = { now: 1700000000000, id: 0, timers: new Map() }
+  function setTimer(fn, ms, repeat) {
+    const id = ++clock.id
+    const delay = Math.max(0, Number(ms) || 0)
+    clock.timers.set(id, { fn: fn, ms: delay, repeat: repeat, next: clock.now + delay })
+    return id
+  }
+  function advance(ms) {
+    const target = clock.now + Math.max(0, Number(ms) || 0)
+    let guard = 0
+    for (;;) {
+      if (guard++ > 50000) throw new Error('虚拟时钟:定时器疑似自激')
+      let pickId = null
+      let pick = null
+      for (const [id, t] of clock.timers) {
+        if (t.next <= target && (pick === null || t.next < pick.next)) { pick = t; pickId = id }
+      }
+      if (pick === null) break
+      clock.now = pick.next
+      if (pick.repeat) pick.next = clock.now + pick.ms
+      else clock.timers.delete(pickId)
+      try { pick.fn() } catch (err) {}
+    }
+    clock.now = target
+  }
+
   const sandbox = {
-    document, window: win, localStorage: storage, console,
-    setInterval() { return 1 }, setTimeout() { return 1 }, clearInterval() {},
+    document, window: win, localStorage: storage, console, __clock: clock,
+    setInterval(fn, ms) { return setTimer(fn, ms, true) },
+    setTimeout(fn, ms) { return setTimer(fn, ms, false) },
+    clearInterval(id) { clock.timers.delete(id) },
+    clearTimeout(id) { clock.timers.delete(id) },
     fetch: async (url, o) => {
       const u = String(url)
       const method = (o && o.method) || 'GET'
@@ -249,9 +281,10 @@ function makeSandbox(opts) {
   }
 
   const ctx = vm.createContext(sandbox)
+  vm.runInContext('Date.now = function () { return globalThis.__clock.now }', ctx)
   vm.runInContext('Math.random = function(){ return 0.5 }', ctx)
 
-  return { sandbox, ctx, document, body, win, net, registered, storage, mo, raf }
+  return { sandbox, ctx, document, body, win, net, registered, storage, mo, raf, advance }
 }
 
 // 造一个"小鲸鱼提示与音效设置面板"的样子
@@ -548,6 +581,31 @@ async function main() {
   S6.body.appendChild(junk)
   ok(hook6.panel.isOpen(), '随后的普通 DOM 变更不该把卡片自动关掉(判据是"面板曾经出现过")')
   S6.panel = hook6.panel
+
+  // ==========================================================================
+  // 关键回归:等不到 overlay 时**绝不放弃**。
+  // 旧实现是 `if (tries > 200) return` —— 10 秒后永久放弃,而且一声不吭。
+  // 后果正是用户遇到的那两个症状同时出现:①「找不到入口行」进不去设置;
+  // ② overlay 没跑起来 ⇒ 持续模式当然也不会跳。这类"静默死掉"必须被测试钉住。
+  // ==========================================================================
+  section('16. 关键回归:overlay 迟到时 panel 绝不永久放弃')
+  const S7 = makeSandbox()
+  // 只加载 panel.js —— 模拟 overlay.js 慢一步(或压根没加载成功)
+  vm.runInContext(fs.readFileSync(path.join(ASSETS, 'panel.js'), 'utf8'), S7.ctx, { filename: 'panel.js' })
+  S7.advance(60000)   // 把时间推过旧的 10 秒放弃点
+  eq(S7.win.__dshDmgNumber, undefined, '此时确实还没有 overlay 的钩子')
+  eq(S7.win.__dshDmgPanelLoaded, true, 'panel.js 自己已经加载了')
+
+  // overlay 迟到了 60 秒才出现
+  vm.runInContext(fs.readFileSync(path.join(ASSETS, 'overlay.js'), 'utf8'), S7.ctx, { filename: 'overlay.js' })
+  await flush()
+  S7.advance(4000)    // 让 panel.js 的下一次重试跑到(此时重试间隔已放慢到 2 秒)
+  await flush()
+  const whale7 = makeWhalePanel(S7.body)
+  S7.advance(4000)
+  await flush()
+  ok(!!whale7.card.querySelector('#dsh-dmg-entry'),
+    '迟到的 overlay 依然让入口行挂上了(旧实现在这里会永久失效)')
 
   console.log('\n' + '='.repeat(58))
   if (failures.length === 0) {

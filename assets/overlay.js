@@ -314,7 +314,10 @@
         // 返回的本来就是"默认值 + 磁盘覆盖"的完整对象,客户端不需要自己兜底重置。
         if (d && typeof d === 'object') applyConfig(d)
       })
-      .catch(function () {})
+      .catch(function (err) {
+        warnOnce('cfg', '读 /dsh-dmg/config.json 失败(' + String((err && err.message) || err)
+          + ') —— 会沿用上一次有效配置(含出厂默认)。')
+      })
   }
 
   // 面板保存:写到宿主(宿主只接受本机回环的写请求),成功后立刻在本地生效
@@ -493,7 +496,23 @@
         setWorking(busy)
         return d
       })
-      .catch(function () { return null })
+      .catch(function (err) {
+        // 这条一旦失败,持续模式会**永远**认为"没在干活"(不报错、不跳动),所以必须留痕。
+        warnOnce('activity', '取 /dsh-dmg/activity.json 失败(' + String((err && err.message) || err)
+          + ') —— 「工作中持续跳」会一直认为没在干活。宿主半区可能是旧版本(重启客户端),'
+          + '或该路由被拦了。')
+        return null
+      })
+  }
+
+  // 只在第一次失败时打一条警告:避免每秒刷屏,但也不让故障彻底静默
+  function warnOnce(tag, msg) {
+    try {
+      warnOnce.seen = warnOnce.seen || {}
+      if (warnOnce.seen[tag]) return
+      warnOnce.seen[tag] = true
+      console.warn('[dsh-damage-number] ' + msg)
+    } catch (err) {}
   }
 
   function syncActivityPoll() {
@@ -586,7 +605,7 @@
   }
 
   var hook = {
-    version: '0.3.1',
+    version: '0.3.2',
     DEFAULT_CFG: DEFAULT_CFG,
     getConfig: function () { return Object.assign({}, cfg) },
     setConfig: function (patch) { return applyConfig(Object.assign({}, cfg, patch || {})) },
@@ -647,6 +666,16 @@
       syncActivityPoll()
       syncActivity()
       timers.push(setInterval(loadConfig, CFG_REFRESH_MS))
+      // 自报家门:一行日志就能回答"这套东西到底加载成功没有、当前是什么模式"。
+      // 排查"没反应"时,先看这一行在不在 —— 不在就是脚本压根没跑起来。
+      try {
+        console.info('[dsh-damage-number] overlay ' + hook.version + ' 就绪'
+          + '  mode=' + (cfg.mode === 'working' ? 'working' : 'turnEnd')
+          + '  tickSec=' + num(cfg.tickSec, 5)
+          + '  推送=' + runtime.sseState
+          + '  轮询=' + curPollMs + 'ms'
+          + (cfg.mode === 'working' ? ('  监督器=' + (!!supervisorTimer) + '  活动轮询=' + (!!activityTimer)) : ''))
+      } catch (err) {}
     })
   }
 
