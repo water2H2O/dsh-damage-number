@@ -118,12 +118,15 @@ dsh plugin --profile web add github:water2H2O/dsh-damage-number
 
 ```powershell
 # 插件状态:版本、配置落点、数据源、信任栅栏是否可用
-curl http://127.0.0.1:3080/dsh-dmg/status.json
+curl http://127.0.0.1:<端口>/dsh-dmg/status.json
 # 当前配置
-curl http://127.0.0.1:3080/dsh-dmg/config.json
+curl http://127.0.0.1:<端口>/dsh-dmg/config.json
 # 浏览器半区脚本
-curl http://127.0.0.1:3080/dsh-dmg/overlay.js
+curl http://127.0.0.1:<端口>/dsh-dmg/overlay.js
 ```
+
+> 端口：`dsh web` 默认 `3080`；官方桌面端是动态端口 —— 在会话里读环境变量 `DSH_WEB_URL` 即可（例如
+> `http://127.0.0.1:19387`）。
 
 > 这些路由都接了 DSH 的浏览器信任栅栏，所以**不带会话凭据的裸 curl 会返回 401**，
 > 伪造 Host 是 403 —— 返回 401/403 就说明路由已注册、栅栏在工作，不是接口坏了。
@@ -144,8 +147,12 @@ node tools/selftest.mjs
 ```
 
 用 `node:vm` + DOM 打桩**真实执行** `assets/overlay.js`（不是复制一份逻辑另测），
-覆盖区间概率边界、阈值退化、seq 驱动去重、seq 回退、数据源不可达、
-配置热更新与畸形载荷、落点计算、关键帧、清理、堆叠上限、鲸鱼缺席降级等 61 项断言。
+当前 **75 项断言**，覆盖：区间概率边界（受控随机数卡在 p 两侧）、阈值退化、
+`seq` 驱动去重与回退、`seq` 持久化（刷新页面补轮次）、`localStorage` 被禁时的退化、
+数据源不可达、配置热更新与畸形载荷、落点计算与拖动跟随、关键帧与清理、堆叠上限、
+鲸鱼缺席降级，以及**宿主与前端两份默认配置的逐字段漂移守卫**。
+
+CI 里可以直接跑它：退出码 0 = 全过，1 = 有失败项。测试台自身异常退出码为 2。
 
 ## 设计取舍
 
