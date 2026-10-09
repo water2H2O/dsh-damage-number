@@ -134,6 +134,33 @@
   }
   function secTitle(txt) { return textEl('div', 'dshwv-bubsec', txt) }
   function hintEl(txt) { return textEl('div', 'dshwv-bubhint', txt) }
+
+  // ---- 受保护的 DOM 写入(致命 bug 的修复) ----
+  // 真实 DOM 里 `el.textContent = x` 就算 x 与当前内容**完全相同**,也会把原文本节点删掉再插一个
+  // 新的 —— 所以它永远是一次 childList 变更。而我们的 MutationObserver 回调里会刷新入口行摘要:
+  //
+  //     回调 → 写 DOM → MutationObserver 再派发 → 回调 → …
+  //
+  // MutationObserver 的回调是**微任务**:每次回调又造出新的变更,就再排一个微任务,队列永远排不空,
+  // 事件循环再也回不到宏任务 —— 整个页面(整个 harness)彻底卡死。
+  // 实测触发点就是「点开小鲸鱼的全局设置」:那是入口行第一次被注入、循环被点燃的那一刻。
+  //
+  // 所以:凡是可能被 observer 回调路径执行到的写入,一律"先比较再写"。
+  // 比较式写入 + 回调里的变更类型过滤 + rAF 合并,三者缺一不可。
+  function setText(el, txt) {
+    if (!el) return false
+    var s = String(txt == null ? '' : txt)
+    if (el.textContent === s) return false   // 值没变 → 一个字节都不写(否则就是风暴的燃料)
+    el.textContent = s
+    return true
+  }
+  function setChecked(el, v) {
+    if (!el) return false
+    var b = !!v
+    if (el.checked === b) return false
+    el.checked = b
+    return true
+  }
   function rowEl(css) {
     return mk('div', '', 'display:flex;align-items:center;gap:6px;justify-content:flex-start;'
       + 'flex-wrap:wrap;margin:5px 0;text-align:left;font-size:12px;color:#203170;' + (css || ''))
@@ -203,10 +230,13 @@
 
   function closeCard() {
     if (!openCard) return
-    try { if (openCard.unregister) openCard.unregister() } catch (err) {}
-    try { if (openCard.timer) clearInterval(openCard.timer) } catch (err) {}
-    try { if (openCard.mask && openCard.mask.parentNode) openCard.mask.parentNode.removeChild(openCard.mask) } catch (err) {}
+    // 先把引用摘掉再动 DOM:移除节点本身是一次 childList 变更,会同步进到 observer 的派发里,
+    // 不摘干净就可能被重入(再次 closeCard)。
+    var cur = openCard
     openCard = null
+    try { if (cur.unregister) cur.unregister() } catch (err) {}
+    try { if (cur.timer) clearInterval(cur.timer) } catch (err) {}
+    try { if (cur.mask && cur.mask.parentNode) cur.mask.parentNode.removeChild(cur.mask) } catch (err) {}
   }
 
   function openPanel() {
@@ -307,9 +337,9 @@
         + 'stroke-linejoin="round" stroke-linecap="round"/>'
       try { svg.innerHTML = grid + lab + path } catch (err) { svg.textContent = '曲线不可用' }
       var q = Math.max(0, Math.min(1, (curveValues().lo + curveValues().hi) / 2))
-      curveInfo.textContent = '下限 ' + fenText(v.lo) + ' → ' + pct(v.base)
+      setText(curveInfo, '下限 ' + fenText(v.lo) + ' → ' + pct(v.base)
         + '　中点 ' + fenText(xRound(q)) + ' → ' + pct(probAt(q, v.lo, v.hi, v.base))
-        + '　上限 ' + fenText(v.hi) + ' → 100%'
+        + '　上限 ' + fenText(v.hi) + ' → 100%')
     }
     function xRound(v) { return isFinite(v) ? Math.round(v * 1e6) / 1e6 : 0 }
 
@@ -337,10 +367,10 @@
     rSim.appendChild(btn('跑', 'no', function () {
       try {
         var r = hook.simulate(yuanOf(C.simFen.value), C.simTimes.value)
-        C.simOut.textContent = '命中 ' + r.hits + '/' + r.times + '（实测 ' + pct(r.rate)
-          + '，理论 ' + pct(r.expected) + '）'
+        setText(C.simOut, '命中 ' + r.hits + '/' + r.times + '（实测 ' + pct(r.rate)
+          + '，理论 ' + pct(r.expected) + '）')
       } catch (err) {
-        C.simOut.textContent = '试算失败:' + String((err && err.message) || err)
+        setText(C.simOut, '试算失败:' + String((err && err.message) || err))
       }
     }, '按当前区间跑这么多次判定,看实测概率与理论值是否吻合'))
     card.appendChild(rSim)
@@ -475,15 +505,15 @@
     }
 
     function doSave() {
-      C.saveMsg.textContent = '保存中…'
+      setText(C.saveMsg, '保存中…')
       C.ok.disabled = true
       hook.saveConfig(buildPatch(collect())).then(function (next) {
         refreshEntry(next)
         closeCard()
       }).catch(function (err) {
         C.ok.disabled = false
-        C.saveMsg.textContent = '⚠ 保存失败:' + String((err && err.message) || err)
-          + '（宿主只接受本机回环的写请求;在局域网/反代地址下打开页面时保存会被拒）'
+        setText(C.saveMsg, '⚠ 保存失败:' + String((err && err.message) || err)
+          + '（宿主只接受本机回环的写请求;在局域网/反代地址下打开页面时保存会被拒）')
       })
     }
 
@@ -496,9 +526,9 @@
         else if (rt.sseState === 'reconnecting') s = '推送:重连中(暂时靠轮询)'
         else if (rt.sseState === 'unsupported') s = '推送:浏览器不支持 EventSource(靠轮询)'
         else s = '推送:已关闭'
-        C.status.textContent = s + '　·　兜底轮询 ' + rt.pollMs + 'ms　·　本次已触发 '
-          + rt.triggers + ' 次' + (rt.lastTrigger ? '(最近:' + rt.lastTrigger + ')' : '')
-      } catch (err) { C.status.textContent = '' }
+        setText(C.status, s + '　·　兜底轮询 ' + rt.pollMs + 'ms　·　本次已触发 '
+          + rt.triggers + ' 次' + (rt.lastTrigger ? '(最近:' + rt.lastTrigger + ')' : ''))
+      } catch (err) { setText(C.status, '') }
     }
 
     // 区间/概率一变就重画曲线
@@ -548,8 +578,9 @@
     if (!entryRow) return
     try {
       var c = cfg || hook.getConfig()
-      if (entryRow.__check) entryRow.__check.checked = c.enabled !== false
-      if (entryRow.__summary) entryRow.__summary.textContent = summaryText(c)
+      // ⚠️ 必须用受保护的写入:这个函数会被 observer 回调调用,直接赋值会点燃微任务风暴(见 setText 上方注释)
+      if (entryRow.__check) setChecked(entryRow.__check, c.enabled !== false)
+      if (entryRow.__summary) setText(entryRow.__summary, summaryText(c))
     } catch (err) {}
   }
 
@@ -564,10 +595,10 @@
       // 入口行左侧的勾 = 总开关,和鲸鱼那四个入口行一样**立即生效**
       hook.saveConfig({ enabled: !!v }).then(function (next) {
         refreshEntry(next)
-        row.__msg.textContent = ''
+        setText(row.__msg, '')
       }).catch(function (err) {
-        check.checked = !v
-        row.__msg.textContent = '保存失败:' + String((err && err.message) || err)
+        setChecked(check, !v)
+        setText(row.__msg, '保存失败:' + String((err && err.message) || err))
       })
     })
     row.appendChild(check)
@@ -612,20 +643,72 @@
     }
   }
 
+  // ---- 观察鲸鱼面板的出现 / 消失 ----
+  // 三道闸门,少一道都会重新点燃微任务风暴:
+  //   ① 写入端:setText/setChecked 先比较再写(回调路径里绝不制造无谓变更);
+  //   ② 回调只对"鲸鱼面板出现/消失"这类变更作出反应,不理会别的一切变更;
+  //   ③ 扫描合并到下一次 rAF,一帧内成百上千次变更只扫一次。
+  var scanScheduled = false
+  var scanCount = 0
+  var panelSeen = false   // 鲸鱼面板是否出现过:只在"曾经在、现在没了"时才自动收起我们的卡片
+
+  function nodeHasPanel(n) {
+    try {
+      if (!n) return false
+      var cls = n.className ? String(n.className) : ''
+      if (cls.indexOf('dshwv-bubmask') >= 0) return true
+      if (typeof n.querySelector === 'function' && n.querySelector('.dshwv-bubmask')) return true
+      return false
+    } catch (err) { return false }
+  }
+
+  function scheduleScan() {
+    if (scanScheduled) return
+    scanScheduled = true
+    var run = function () {
+      scanScheduled = false
+      scanCount++
+      try {
+        tryInject()
+        // 鲸鱼的设置面板**从有到无**时,别把我们的卡片孤零零留在屏幕上。
+        // 注意判据是"曾经出现过"而不是"现在不在" —— 否则用控制台 openPanel() 在没有鲸鱼面板时
+        // 打开卡片,下一次任意变更就会把它自己关掉。
+        var hasPanel = whalePanelCards().length > 0
+        if (hasPanel) panelSeen = true
+        else if (panelSeen) {
+          panelSeen = false
+          if (openCard) closeCard()
+        }
+      } catch (err) {}
+    }
+    try {
+      if (typeof window.requestAnimationFrame === 'function') { window.requestAnimationFrame(run); return }
+    } catch (err) {}
+    setTimeout(run, 16)
+  }
+
   function watch() {
     try {
       if (typeof window.MutationObserver === 'function') {
-        var mo = new window.MutationObserver(function () {
+        var mo = new window.MutationObserver(function (records) {
+          var relevant = false
           try {
-            tryInject()
-            // 鲸鱼的设置面板被关掉时,别把我们的卡片孤零零留在屏幕上
-            if (openCard && whalePanelCards().length === 0) closeCard()
-          } catch (err) {}
+            var recs = records || []
+            for (var i = 0; i < recs.length && !relevant; i++) {
+              var r = recs[i]
+              var add = (r && r.addedNodes) || []
+              var rem = (r && r.removedNodes) || []
+              for (var a = 0; a < add.length; a++) { if (nodeHasPanel(add[a])) { relevant = true; break } }
+              if (relevant) break
+              for (var b = 0; b < rem.length; b++) { if (nodeHasPanel(rem[b])) { relevant = true; break } }
+            }
+          } catch (err) { relevant = true }   // 判断本身出错时宁可多扫一次,也不要漏掉面板
+          if (relevant) scheduleScan()
         })
         mo.observe(document.body || document.documentElement, { childList: true, subtree: true })
       }
     } catch (err) {}
-    // MutationObserver 不可用/漏事件时的兜底
+    // MutationObserver 不可用 / 漏事件时的兜底。refreshEntry 已比较后再写,所以这里不会自激。
     setInterval(function () {
       try {
         tryInject()
@@ -643,6 +726,7 @@
         pct: pct, fenText: fenText, summaryText: summaryText, buildPatch: buildPatch,
         open: openPanel, close: closeCard, tryInject: tryInject, isOpen: function () { return !!openCard },
         entry: function () { return entryRow },
+        scanCount: function () { return scanCount },   // 供测试台验证"扫描被 rAF 合并压住、且不会自激"
       }
       // 配置从别处变了(例如另一个标签页保存)就刷新入口行摘要
       try { hook.onConfigChange(function (c) { refreshEntry(c) }) } catch (err) {}

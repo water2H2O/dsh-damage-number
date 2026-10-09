@@ -14,7 +14,11 @@ import vm from 'node:vm'
 import { fileURLToPath } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const ASSETS = path.resolve(HERE, '..', 'assets')
+// 允许指向别处的 assets —— 用来对"回归用例本身"做反向验证:
+// 把修复退回去、确认这套断言真的会失败(runaway),才证明它不是碰巧通过。
+const ASSETS = process.env.DSH_DMG_ASSETS
+  ? path.resolve(process.env.DSH_DMG_ASSETS)
+  : path.resolve(HERE, '..', 'assets')
 
 // ---------------- 断言 ----------------
 let passed = 0
@@ -37,28 +41,39 @@ function matchSimple(el, sel) {
   return String(el.tagName || '').toLowerCase() === s.toLowerCase()
 }
 
-function makeEl(tag) {
+// ⚠️ 这个桩必须**自带变更派发**,否则 panel.js 会静默走 MutationObserver 的兜底分支,
+//    主路径永远测不到 —— 那正是"点开全局设置卡死整个 harness"这条致命 bug 溜过去的原因。
+//    makeEl 的每次 childList 变更都会通知派发器;派发器用**有上限**的循环模拟"回调又产生变更",
+//    超限即判定为失控(runaway),把"卡死"变成可断言的失败。
+function makeEl(tag, notify) {
   const el = {
     tagName: String(tag).toUpperCase(),
-    id: '', className: '', textContent: '', innerHTML: '', title: '',
+    id: '', className: '', innerHTML: '', title: '',
     type: '', value: '', checked: false, disabled: false,
     min: '', max: '', step: '',
-    children: [], parentNode: null, __attrs: {}, __listeners: {},
+    children: [], parentNode: null, __attrs: {}, __listeners: {}, __text: '',
     style: { cssText: '', zIndex: '', setProperty() {} },
     setAttribute(k, v) { el.__attrs[k] = String(v) },
     getAttribute(k) { return Object.prototype.hasOwnProperty.call(el.__attrs, k) ? el.__attrs[k] : null },
-    appendChild(c) { c.parentNode = el; el.children.push(c); return c },
+    appendChild(c) {
+      c.parentNode = el
+      el.children.push(c)
+      if (notify) notify({ target: el, addedNodes: [c], removedNodes: [] })
+      return c
+    },
     insertBefore(c, ref) {
       c.parentNode = el
       const i = el.children.indexOf(ref)
       if (i < 0) el.children.push(c)
       else el.children.splice(i, 0, c)
+      if (notify) notify({ target: el, addedNodes: [c], removedNodes: [] })
       return c
     },
     removeChild(c) {
       const i = el.children.indexOf(c)
       if (i >= 0) el.children.splice(i, 1)
       c.parentNode = null
+      if (notify) notify({ target: el, addedNodes: [], removedNodes: [c] })
       return c
     },
     addEventListener(type, fn) { (el.__listeners[type] = el.__listeners[type] || []).push(fn) },
@@ -80,6 +95,19 @@ function makeEl(tag) {
     },
     querySelector(sel) { const r = el.querySelectorAll(sel); return r.length ? r[0] : null },
   }
+  // 真实 DOM:给 textContent 赋值会先清空子节点再插一个文本节点 ——
+  // 即使内容与原来**完全相同**,它依然是一次 childList 变更。这条语义必须忠实,否则测不出风暴。
+  Object.defineProperty(el, 'textContent', {
+    get() { return el.__text },
+    set(v) {
+      const s = String(v == null ? '' : v)
+      const removed = el.children.slice()
+      for (const c of removed) c.parentNode = null
+      el.children.length = 0
+      el.__text = s
+      if (notify) notify({ target: el, addedNodes: [], removedNodes: removed })
+    },
+  })
   return el
 }
 
@@ -97,13 +125,73 @@ function makeSandbox(opts) {
     setItem(k, v) { storageMap.set(k, String(v)) },
     removeItem(k) { storageMap.delete(k) },
   }
-  const body = makeEl('body')
+
+  // ---- 变更派发 + 有上限的"微任务/帧"排空 ----
+  // runaway=true 就代表真实浏览器里的那种**微任务风暴**(主线程被占死、整个页面卡住)。
+  const mo = { observers: [], queue: [], pending: false, delivering: false, runaway: false, MAX: 400, deliveries: 0 }
+  const raf = { queue: [], draining: false, runaway: false, MAX: 400, runs: 0 }
+  let bodyRef = null
+  function inDoc(n) {
+    let p = n
+    while (p) { if (p === bodyRef) return true; p = p.parentNode }
+    return false
+  }
+  function notifyMutation(rec) {
+    if (!mo.observers.length) return
+    if (!rec || !inDoc(rec.target)) return   // 忠实于"只观察被观察子树":游离节点上的变更不算
+    mo.queue.push(rec)
+    mo.pending = true
+    if (mo.delivering) return
+    mo.delivering = true
+    let guard = 0
+    while (mo.pending && guard < mo.MAX) {
+      guard++
+      mo.pending = false
+      const recs = mo.queue.slice()
+      mo.queue.length = 0
+      for (const o of mo.observers) {
+        if (o.disconnected) continue
+        try { o.cb(recs) } catch (err) {}
+      }
+      mo.deliveries++
+    }
+    mo.delivering = false
+    if (guard >= mo.MAX) mo.runaway = true
+  }
+  function MutationObserverStub(cb) {
+    const inst = {
+      cb, disconnected: false, observing: false,
+      observe() { inst.observing = true },
+      disconnect() { inst.disconnected = true },
+      takeRecords() { return [] },
+    }
+    mo.observers.push(inst)
+    return inst
+  }
+  function rafStub(fn) {
+    raf.queue.push(fn)
+    if (raf.draining) return 1
+    raf.draining = true
+    let guard = 0
+    while (raf.queue.length && guard < raf.MAX) {
+      guard++
+      const f = raf.queue.shift()
+      try { f() } catch (err) {}
+      raf.runs++
+    }
+    raf.draining = false
+    if (guard >= raf.MAX) raf.runaway = true
+    return 1
+  }
+
+  const body = makeEl('body', notifyMutation)
+  bodyRef = body
   const document = {
     readyState: 'complete',
     body,
     documentElement: body,
-    createElement: (t) => makeEl(t),
-    createElementNS: (ns, t) => makeEl(t),
+    createElement: (t) => makeEl(t, notifyMutation),
+    createElementNS: (ns, t) => makeEl(t, notifyMutation),
     addEventListener() {},
     getElementById(id) {
       const walk = (n) => {
@@ -126,6 +214,8 @@ function makeSandbox(opts) {
   const win = {
     innerWidth: 1200, innerHeight: 800,
     localStorage: storage,
+    MutationObserver: MutationObserverStub,
+    requestAnimationFrame: rafStub,
     dshwRegisterMask(el) { registered.push(el); return function () {} },
     getComputedStyle(el) { return { zIndex: (el && el.style && el.style.zIndex) || 'auto' } },
   }
@@ -156,7 +246,7 @@ function makeSandbox(opts) {
   const ctx = vm.createContext(sandbox)
   vm.runInContext('Math.random = function(){ return 0.5 }', ctx)
 
-  return { sandbox, ctx, document, body, win, net, registered, storage }
+  return { sandbox, ctx, document, body, win, net, registered, storage, mo, raf }
 }
 
 // 造一个"小鲸鱼提示与音效设置面板"的样子
@@ -356,6 +446,59 @@ async function main() {
   const m2 = S2.body.querySelectorAll('.dshwv-bubmask').filter((m) => m.getAttribute('data-dsh-dmg'))[0]
   eq(m2.style.zIndex, '40050', '鲸鱼面板 40000 → 我们自动跟到 40050')
   hook2.panel.close()
+
+  // ==========================================================================
+  // 关键回归:致命 bug —— "点开全局设置整个 harness 卡死"
+  // 根因:MutationObserver 回调里 `el.textContent = x` 即使内容不变也永远是一次 childList 变更,
+  //       于是 回调 → 写 DOM → 再派发 → 回调 … 微任务队列永远排不空,主线程被占死。
+  // 这里用真实派发 + 有上限的排空来复现那种"风暴",失控会被标成 runaway。
+  // ==========================================================================
+  section('14. 关键回归:observer 回调绝不能自激成微任务风暴')
+  const S5 = makeSandbox()
+  loadAssets(S5)                      // 先加载,此时还没有鲸鱼面板
+  await flush()
+  const hook5 = S5.win.__dshDmgNumber
+  ok(!S5.mo.runaway && !S5.raf.runaway, '无面板时一切平静')
+
+  const whale5 = makeWhalePanel(S5.body)   // ← 等价于用户点开「全局设置」的那一刻
+  eq(!!whale5.card.querySelector('#dsh-dmg-entry'), true, '面板出现后入口行被注入')
+  ok(!S5.mo.runaway, '注入过程没有把 observer 打成一团(runaway 必须为 false)')
+  ok(!S5.raf.runaway, 'rAF 合并没有失控')
+
+  // 页面持续活动:200 次普通 DOM 变更。旧实现会在这里被反复点燃。
+  const scansBefore = hook5.panel.scanCount()
+  for (let i = 0; i < 200; i++) {
+    const d = S5.document.createElement('div')
+    d.textContent = 'churn ' + i
+    S5.body.appendChild(d)
+  }
+  ok(!S5.mo.runaway && !S5.raf.runaway, '200 次普通 DOM 变更后依然没有自激')
+  ok(hook5.panel.scanCount() - scansBefore < 60,
+    '扫描次数被变更过滤 + rAF 合并压住(而不是每次变更都全量扫一遍)',
+    'scans=' + (hook5.panel.scanCount() - scansBefore))
+
+  // 反向验证:守卫只能拦"没变"的写入,不能把该更新的也拦掉
+  const entry5 = hook5.panel.entry()
+  hook5.setConfig({ enabled: false, minAmount: 0.02, maxAmount: 0.2, minProbability: 0.5 })
+  await flush()
+  eq(entry5.__summary.textContent, '已关闭', '配置真的变了 → 入口行摘要照常更新(守卫没拦错东西)')
+  hook5.setConfig({ enabled: true })
+  await flush()
+  eq(entry5.__summary.textContent, '2 分–20 分 · 50%→100%', '再次变化也照常更新')
+  ok(!S5.mo.runaway, '这些更新全程没有引发风暴')
+
+  section('15. 卡片不会自己关掉自己')
+  const S6 = makeSandbox()
+  loadAssets(S6)                      // 这里**不建**鲸鱼面板
+  await flush()
+  const hook6 = S6.win.__dshDmgNumber
+  hook6.panel.open()
+  ok(hook6.panel.isOpen(), '没有鲸鱼面板时也能打开卡片')
+  const junk = S6.document.createElement('div')
+  junk.textContent = 'later mutation'
+  S6.body.appendChild(junk)
+  ok(hook6.panel.isOpen(), '随后的普通 DOM 变更不该把卡片自动关掉(判据是"面板曾经出现过")')
+  S6.panel = hook6.panel
 
   console.log('\n' + '='.repeat(58))
   if (failures.length === 0) {
