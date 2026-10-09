@@ -1,0 +1,38 @@
+{
+  "name": "dsh-damage-number",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH 挂件:每轮对话消耗进入设定区间后,按概率在小鲸鱼头顶弹出红色伤害数字(达到区间上限必定弹出)",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "damage-number",
+    "cost",
+    "widget"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "assets",
+    "tools",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/water2H2O/dsh-damage-number.git"
+  },
+  "bugs": {
+    "url": "https://github.com/water2H2O/dsh-damage-number/issues"
+  },
+  "homepage": "https://github.com/water2H2O/dsh-damage-number#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

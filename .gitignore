@@ -1,0 +1,13 @@
+# 依赖与构建产物
+node_modules/
+*.log
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 本插件运行时配置（真实位置在 $DSH_HOME，不该进仓库）
+.dshdmg.json

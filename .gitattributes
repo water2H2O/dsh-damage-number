@@ -1,0 +1,13 @@
+# 统一用 LF 入库，避免 Windows/macOS 协作时整文件 diff 噪音
+* text=auto eol=lf
+
+# 二进制资源（本插件目前没有，留给以后加图片/音效时用）
+*.png binary
+*.gif binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.mp3 binary
+*.wav binary
+*.ogg binary

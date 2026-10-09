@@ -1,0 +1,13 @@
+# ============================================================================
+# dsh-damage-number —— DSH bundle patch(挂载声明)
+# ============================================================================
+# 安装(桌面端 profile;桌面端不能用 --profile desktop 命令行,请在会话里让
+# DSH 用内置 plugin_manager 安装,或按 profile 目录手工 link:):
+#   dsh plugin --profile web add link:<本目录绝对路径>
+# 卸载:
+#   dsh plugin --profile web remove dsh-damage-number
+# ============================================================================
+
+- insert:
+    - id: damage-number
+      name: dsh-damage-number
