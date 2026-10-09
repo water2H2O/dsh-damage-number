@@ -63,22 +63,8 @@
     if (ratio > 1) ratio = 1
     return b + (1 - b) * ratio
   }
-  // 曲线采样点:[{x:0..1, p:0..1}] —— x 是区间内进度
-  function curvePoints(lo, hi, base, steps) {
-    var n = Math.max(2, Math.round(Number(steps) || 24))
-    var out = []
-    var l = Number(lo), h = Number(hi)
-    if (!isFinite(l)) l = 0
-    if (!isFinite(h) || h <= l) {
-      // 退化成阈值:0 之前必不跳,到阈值直接 100%
-      return [{ x: 0, p: 0 }, { x: 0.999, p: 0 }, { x: 1, p: 1 }]
-    }
-    for (var i = 0; i <= n; i++) {
-      var x = i / n
-      out.push({ x: x, p: probAt(l + (h - l) * x, l, h, base) })
-    }
-    return out
-  }
+  // 曲线采样点曾经用来画面板里的概率曲线;那条曲线已从界面里拿掉了,
+  // 所以这里也一并删掉 —— 留着没人调用的实现比删掉更容易误导人。
   function pct(v) {
     var n = Number(v)
     if (!isFinite(n)) n = 0
@@ -98,6 +84,8 @@
     return range + ' · ' + pct(Number(c.minProbability)) + '→100%'
   }
   // 由界面控件值组装出要 PUT 的补丁(单位换算只在这里发生)
+  // 只产出**界面暴露的**那几个键。其余键由 saveConfig 用现有 cfg 兜底合并 ——
+  // 这正是"界面瘦身"能安全做的原因:拿掉一个控件,不会顺手把那个配置项清成默认值。
   function buildPatch(v) {
     return {
       enabled: !!v.enabled,
@@ -106,20 +94,9 @@
       minAmount: yuanOf(v.minFen),
       maxAmount: yuanOf(v.maxFen),
       minProbability: Math.max(0, Math.min(1, Number(v.minPct) / 100)) || 0,
-      pushEnabled: !!v.pushEnabled,
-      mainSessionOnly: !!v.mainSessionOnly,
-      pollMs: Math.max(250, Math.min(60000, Math.round(Number(v.pollMs) || 2000))),
-      prefix: String(v.prefix == null ? '-¥' : v.prefix),
-      decimals: Math.max(0, Math.min(6, Math.round(Number(v.decimals) || 0))),
-      color: String(v.color || '#ff3b30'),
-      strokeColor: String(v.strokeColor || '#ffffff'),
-      strokeWidth: Math.max(0, Number(v.strokeWidth) || 0),
-      fontSizePx: Math.max(8, Number(v.fontSizePx) || 30),
-      risePx: Math.max(0, Number(v.risePx) || 0),
       riseMs: Math.max(200, Number(v.riseMs) || 1800),
       // 界面按百分比填(「横向偏移 18%」比「jitterX 0.18」友好),配置里仍是 0~1 的比例
       jitterX: Math.max(0, Math.min(1, (Number(v.jitterPct) || 0) / 100)),
-      maxStack: Math.max(1, Math.round(Number(v.maxStack) || 1)),
     }
   }
 
@@ -135,7 +112,6 @@
     e.textContent = txt
     return e
   }
-  function secTitle(txt) { return textEl('div', 'dshwv-bubsec', txt) }
   function hintEl(txt) { return textEl('div', 'dshwv-bubhint', txt) }
 
   // ---- 受保护的 DOM 写入(致命 bug 的修复) ----
@@ -181,29 +157,11 @@
     if (opts.title) i.title = opts.title
     return i
   }
-  function textInput(value, opts) {
-    opts = opts || {}
-    var i = mk('input', 'dshwv-number')
-    i.type = 'text'
-    i.value = String(value)
-    i.style.width = opts.width || '56px'
-    if (opts.title) i.title = opts.title
-    return i
-  }
   function checkBox(checked, onChange) {
     var c = mk('input', 'dshwv-check')
     c.type = 'checkbox'
     c.checked = !!checked
     if (onChange) c.addEventListener('change', function () { onChange(!!c.checked) })
-    return c
-  }
-  function colorInput(value, opts) {
-    opts = opts || {}
-    var c = mk('input', '', 'width:34px;height:22px;padding:0;border:1px solid rgba(32,49,112,.4);'
-      + 'border-radius:5px;background:#fff;cursor:pointer;box-sizing:border-box')
-    c.type = 'color'
-    c.value = String(value || '#ff3b30')
-    if (opts.title) c.title = opts.title
     return c
   }
   function btn(txt, kind, onClick, title) {
@@ -228,29 +186,6 @@
     s.value = value === 'working' ? 'working' : 'turnEnd'
     return s
   }
-  // 默认折起的分组。刻意用原生 DOM + 内联样式,不用 <details>,免得和鲸鱼的样式/事件打架。
-  function collapsible(host, title) {
-    var wrap = mk('div', '', 'margin-top:10px;border-top:1px solid rgba(32,49,112,.12)')
-    var head = mk('div', '', 'display:flex;align-items:center;gap:6px;padding:7px 2px;cursor:pointer;'
-      + 'font-size:12px;color:#9fb0d9;user-select:none;text-align:left')
-    var arrow = textEl('span', '', '▸', 'font-size:11px')
-    head.appendChild(arrow)
-    head.appendChild(textEl('span', '', title, 'font-size:12px;color:#9fb0d9'))
-    var body = mk('div', '', '')
-    // 显式设 display 属性而不是塞进 cssText:两者在浏览器里等价,但这样状态是**可读的**
-    // (折叠逻辑自己也要读它,测试台也能据此断言"高级区默认是折起的")。
-    body.style.display = 'none'
-    head.addEventListener('click', function () {
-      var open = body.style.display !== 'none'
-      body.style.display = open ? 'none' : 'block'
-      setText(arrow, open ? '▸' : '▾')
-    })
-    wrap.appendChild(head)
-    wrap.appendChild(body)
-    host.appendChild(wrap)
-    return { wrap: wrap, head: head, body: body }
-  }
-
   // ======================== 设置卡片 ========================
   function topZ() {
     // 我们的卡片是从鲸鱼面板里打开的,必须盖在它上面。
@@ -309,8 +244,7 @@
     rMode.appendChild(C.mode)
     card.appendChild(rMode)
 
-    // ---------- 2. 跳动规则 ----------
-    card.appendChild(secTitle('跳动规则'))
+    // ---------- 2. 跳动规则(只留真正需要动的三个数) ----------
     var rRange = rowEl()
     rRange.appendChild(labEl('区间'))
     C.minFen = numInput(fenOf(base.minAmount), { min: 0, step: 0.5, width: '56px', title: '低于这个消耗不会跳(单位:分)' })
@@ -322,92 +256,23 @@
     card.appendChild(rRange)
 
     var rP = rowEl()
-    rP.appendChild(labEl('下限处概率'))
-    C.minPct = numInput(Math.round(Number(base.minProbability) * 1000) / 10, { min: 0, max: 100, step: 5, width: '56px', title: '刚好达到下限时的触发概率;越接近上限概率越大' })
+    rP.appendChild(labEl('下限概率'))
+    C.minPct = numInput(Math.round(Number(base.minProbability) * 1000) / 10, { min: 0, max: 100, step: 5, width: '56px', title: '刚好达到下限时的触发概率;越接近上限概率越大(上限处必定跳)' })
     rP.appendChild(C.minPct)
-    rP.appendChild(labEl('%   →  上限处 100%'))
+    rP.appendChild(labEl('%   →   上限处 100%'))
     card.appendChild(rP)
 
     var rTick = rowEl()
     rTick.appendChild(labEl('间隔'))
     C.tickSec = numInput(base.tickSec != null ? base.tickSec : 5, { min: 0.5, max: 3600, step: 0.5, width: '60px', title: '「工作中每隔一段时间跳」的间隔秒数' })
     rTick.appendChild(C.tickSec)
-    rTick.appendChild(labEl('秒(仅持续模式)'))
+    rTick.appendChild(labEl('秒'))
     card.appendChild(rTick)
 
     C.modeHint = hintEl('')
     card.appendChild(C.modeHint)
 
-    // ---------- 2. 概率曲线 ----------
-    card.appendChild(secTitle('概率曲线'))
-    var svg = document.createElementNS
-      ? document.createElementNS('http://www.w3.org/2000/svg', 'svg')
-      : mk('div')
-    try {
-      svg.setAttribute('viewBox', '0 0 400 120')
-      svg.setAttribute('width', '100%')
-      svg.setAttribute('height', '120')
-      svg.style.cssText = 'display:block;background:#fff;border:1px solid rgba(32,49,112,.15);border-radius:8px'
-    } catch (err) {}
-    card.appendChild(svg)
-    C.curve = svg
-    var curveInfo = hintEl('')
-    card.appendChild(curveInfo)
-    C.curveInfo = curveInfo
-
-    function curveValues() {
-      return {
-        lo: yuanOf(C.minFen.value),
-        hi: yuanOf(C.maxFen.value),
-        base: Math.max(0, Math.min(1, Number(C.minPct.value) / 100)) || 0,
-      }
-    }
-    function redraw() {
-      var v = curveValues()
-      var pts = curvePoints(v.lo, v.hi, v.base, 24)
-      var W = 400, H = 120, padL = 34, padR = 12, padT = 10, padB = 20
-      var iw = W - padL - padR, ih = H - padT - padB
-      var seg = []
-      for (var i = 0; i < pts.length; i++) {
-        var x = padL + iw * pts[i].x
-        var y = padT + ih * (1 - pts[i].p)
-        seg.push((i === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + y.toFixed(1))
-      }
-      var grid = ''
-      var gl = [0, 0.25, 0.5, 0.75, 1]
-      for (var g = 0; g < gl.length; g++) {
-        var gy = padT + ih * (1 - gl[g])
-        grid += '<line x1="' + padL + '" y1="' + gy.toFixed(1) + '" x2="' + (padL + iw) + '" y2="' + gy.toFixed(1)
-          + '" stroke="rgba(32,49,112,.12)" stroke-width="1"/>'
-        grid += '<text x="' + (padL - 5) + '" y="' + (gy + 3.5).toFixed(1)
-          + '" font-size="9" fill="#9fb0d9" text-anchor="end">' + Math.round(gl[g] * 100) + '%</text>'
-      }
-      var lab = '<text x="' + padL + '" y="' + (H - 6) + '" font-size="9.5" fill="#9fb0d9">'
-        + fenText(v.lo) + '</text>'
-        + '<text x="' + (padL + iw) + '" y="' + (H - 6) + '" font-size="9.5" fill="#9fb0d9" text-anchor="end">'
-        + fenText(v.hi) + '</text>'
-        + '<line x1="' + padL + '" y1="' + (padT + ih) + '" x2="' + (padL + iw) + '" y2="' + (padT + ih)
-        + '" stroke="rgba(32,49,112,.3)" stroke-width="1"/>'
-      var path = '<path d="' + seg.join(' ') + '" fill="none" stroke="#e0433f" stroke-width="2.4" '
-        + 'stroke-linejoin="round" stroke-linecap="round"/>'
-      try { svg.innerHTML = grid + lab + path } catch (err) { svg.textContent = '曲线不可用' }
-      var q = Math.max(0, Math.min(1, (curveValues().lo + curveValues().hi) / 2))
-      setText(curveInfo, '下限 ' + fenText(v.lo) + ' → ' + pct(v.base)
-        + '　中点 ' + fenText(xRound(q)) + ' → ' + pct(probAt(q, v.lo, v.hi, v.base))
-        + '　上限 ' + fenText(v.hi) + ' → 100%')
-    }
-    function xRound(v) { return isFinite(v) ? Math.round(v * 1e6) / 1e6 : 0 }
-
-    // ---------- 3. 外观(基础) ----------
-    card.appendChild(secTitle('外观'))
-    var rLook = rowEl()
-    rLook.appendChild(labEl('字号'))
-    C.fontSizePx = numInput(base.fontSizePx, { min: 8, max: 200, step: 2, width: '56px' })
-    rLook.appendChild(C.fontSizePx)
-    rLook.appendChild(labEl('px　颜色'))
-    C.color = colorInput(base.color)
-    rLook.appendChild(C.color)
-    card.appendChild(rLook)
+    // ---------- 3. 观感(只留最影响手感的两项) ----------
 
     var rMotion = rowEl()
     rMotion.appendChild(labEl('显示时长'))
@@ -420,95 +285,13 @@
     card.appendChild(rMotion)
 
     // ---------- 4. 预览(不花一分钱) ----------
+    // 只有一个按钮:在中点金额上就地飘一个。三个金额的版本、以及掷骰子试算,都从界面里去掉了 ——
+    // 需要的话用控制台 __dshDmgNumber.preview(x) / simulate(x, n)。
     var rPrev = rowEl()
-    C.btnLo = btn('预览下限', 'no', function () { hook.preview(yuanOf(C.minFen.value)) }, '在下限金额上直接飘一个,只看外观')
-    C.btnMid = btn('预览中点', 'no', function () {
+    rPrev.appendChild(btn('预览一下', 'no', function () {
       hook.preview(yuanOf((Number(C.minFen.value) + Number(C.maxFen.value)) / 2))
-    }, '在中点金额上直接飘一个')
-    C.btnHi = btn('预览上限', 'no', function () { hook.preview(yuanOf(C.maxFen.value)) }, '在上限金额上直接飘一个')
-    rPrev.appendChild(C.btnLo)
-    rPrev.appendChild(C.btnMid)
-    rPrev.appendChild(C.btnHi)
+    }, '就地飘一个数字,只看外观:不发请求、不做判定、不花任何钱'))
     card.appendChild(rPrev)
-    card.appendChild(hintEl('预览只在本机画一个数字:不发请求、不做判定、不花任何钱。'))
-
-    // ---------- 5. 高级(默认折起) ----------
-    var adv = collapsible(card, '高级(触发通道 · 描边 · 文本 · 试算)')
-
-    adv.body.appendChild(secTitle('触发通道'))
-    var rPush = rowEl()
-    C.pushEnabled = checkBox(base.pushEnabled !== false)
-    rPush.appendChild(C.pushEnabled)
-    rPush.appendChild(labEl('宿主推送即时触发'))
-    adv.body.appendChild(rPush)
-    adv.body.appendChild(hintEl('宿主在每轮结束的同一刻用 SSE 通知页面立刻取数(延迟几毫秒);关掉则退回下面的轮询。'))
-
-    var rMain = rowEl()
-    C.mainSessionOnly = checkBox(base.mainSessionOnly === true)
-    rMain.appendChild(C.mainSessionOnly)
-    rMain.appendChild(labEl('只对主会话生效'))
-    adv.body.appendChild(rMain)
-    adv.body.appendChild(hintEl('小鲸鱼的金额对任意会话的 turn/end 都会刷新(子代理也算)。勾上后子代理轮次不再即时触发,也不计入「工作中」。'))
-
-    var rPoll = rowEl()
-    rPoll.appendChild(labEl('兜底轮询'))
-    C.pollMs = numInput(base.pollMs != null ? base.pollMs : 2000, { min: 250, max: 60000, step: 250, width: '70px' })
-    rPoll.appendChild(C.pollMs)
-    rPoll.appendChild(labEl('ms'))
-    adv.body.appendChild(rPoll)
-
-    C.status = hintEl('')
-    adv.body.appendChild(C.status)
-
-    adv.body.appendChild(secTitle('描边与文本'))
-    var rStroke = rowEl()
-    rStroke.appendChild(labEl('描边'))
-    C.strokeWidth = numInput(base.strokeWidth, { min: 0, max: 12, step: 1, width: '44px', title: '描边宽度,0 = 无描边' })
-    rStroke.appendChild(C.strokeWidth)
-    rStroke.appendChild(labEl('px'))
-    C.strokeColor = colorInput(base.strokeColor, { title: '描边颜色(保证在任何背景上都看得清)' })
-    rStroke.appendChild(C.strokeColor)
-    adv.body.appendChild(rStroke)
-
-    var rTxt = rowEl()
-    rTxt.appendChild(labEl('前缀'))
-    C.prefix = textInput(base.prefix, { width: '56px', title: '金额前面的文字,例如 -¥' })
-    rTxt.appendChild(C.prefix)
-    rTxt.appendChild(labEl('小数位'))
-    C.decimals = numInput(base.decimals, { min: 0, max: 6, step: 1, width: '44px' })
-    rTxt.appendChild(C.decimals)
-    adv.body.appendChild(rTxt)
-
-    var rAdv2 = rowEl()
-    rAdv2.appendChild(labEl('上浮距离'))
-    C.risePx = numInput(base.risePx, { min: 0, max: 600, step: 8, width: '56px' })
-    rAdv2.appendChild(C.risePx)
-    rAdv2.appendChild(labEl('px　同屏上限'))
-    C.maxStack = numInput(base.maxStack, { min: 1, max: 20, step: 1, width: '44px' })
-    rAdv2.appendChild(C.maxStack)
-    adv.body.appendChild(rAdv2)
-
-    adv.body.appendChild(secTitle('试算(掷骰子,不花钱)'))
-    var rSim = rowEl()
-    rSim.appendChild(labEl('金额'))
-    C.simFen = numInput(fenOf((Number(base.minAmount) + Number(base.maxAmount)) / 2), { min: 0, step: 0.5, width: '56px', title: '要试算的消耗(分)' })
-    rSim.appendChild(C.simFen)
-    rSim.appendChild(labEl('分 ×'))
-    C.simTimes = numInput(2000, { min: 1, max: 20000, step: 100, width: '62px', title: '掷多少次骰子' })
-    rSim.appendChild(C.simTimes)
-    rSim.appendChild(labEl('次'))
-    rSim.appendChild(btn('跑', 'no', function () {
-      try {
-        var r = hook.simulate(yuanOf(C.simFen.value), C.simTimes.value)
-        setText(C.simOut, '命中 ' + r.hits + '/' + r.times + '（实测 ' + pct(r.rate)
-          + '，理论 ' + pct(r.expected) + '）')
-      } catch (err) {
-        setText(C.simOut, '试算失败:' + String((err && err.message) || err))
-      }
-    }, '按当前区间跑这么多次判定,看实测概率与理论值是否吻合'))
-    adv.body.appendChild(rSim)
-    C.simOut = hintEl('')
-    adv.body.appendChild(C.simOut)
 
     // ---------- 底栏 ----------
     var btns = mk('div', 'dshwv-bubbtns')
@@ -520,18 +303,16 @@
     C.saveMsg = hintEl('')
     card.appendChild(C.saveMsg)
 
-    // 模式不同,规则说明与「间隔」是否可用都要跟着变(说明文字放这里,是为了让基础区一眼看懂当前模式)
+    // 模式不同:说明文字与「间隔」是否可用都要跟着变
     function syncModeEnabled() {
       var isWorking = C.mode.value === 'working'
       C.tickSec.disabled = !isWorking
       if (isWorking) {
         var sec = Number(C.tickSec.value)
         if (!isFinite(sec) || sec < 0.5) sec = 5
-        setText(C.modeHint, '对话进行期间每 ' + sec + ' 秒无条件跳一次,金额 = 上一轮的真实金额;'
-          + '每轮结束那一次仍按上面的区间概率判定。停在"工作中"只由宿主的活动状态决定。')
+        setText(C.modeHint, '干活期间每 ' + sec + ' 秒跳一次(数字 = 上一轮的金额);每轮结束那次仍按区间概率判定。')
       } else {
-        setText(C.modeHint, '每轮结束时按上面的区间概率跳一次:低于下限不跳,区间内概率线性递增,'
-          + '达到/超过上限必定跳。上下限填成一样 = 纯阈值。')
+        setText(C.modeHint, '每轮结束时按区间概率跳一次:到上限必定跳;上下限填一样 = 纯阈值。')
       }
     }
     C.mode.addEventListener('change', syncModeEnabled)
@@ -539,6 +320,8 @@
     C.tickSec.addEventListener('change', syncModeEnabled)
 
     // ---------- 取值/回填 ----------
+    // ⚠️ 只收集**界面上真实存在的**控件。其余键(描边/前缀/小数位/推送/轮询…)不在界面里,
+    //    但 saveConfig 会拿现有 cfg 做底再合并这个补丁,所以它们原样保留、不会被这次保存清掉。
     function collect() {
       return {
         enabled: C.enabled.checked,
@@ -547,19 +330,8 @@
         minFen: Number(C.minFen.value),
         maxFen: Number(C.maxFen.value),
         minPct: Number(C.minPct.value),
-        pushEnabled: C.pushEnabled.checked,
-        mainSessionOnly: C.mainSessionOnly.checked,
-        pollMs: Number(C.pollMs.value),
-        prefix: C.prefix.value,
-        decimals: Number(C.decimals.value),
-        color: C.color.value,
-        strokeColor: C.strokeColor.value,
-        strokeWidth: Number(C.strokeWidth.value),
-        fontSizePx: Number(C.fontSizePx.value),
-        risePx: Number(C.risePx.value),
         riseMs: Number(C.riseMs.value),
         jitterPct: Number(C.jitterPct.value),
-        maxStack: Number(C.maxStack.value),
       }
     }
     function fill(c) {
@@ -570,21 +342,9 @@
       C.minFen.value = String(fenOf(c.minAmount))
       C.maxFen.value = String(fenOf(c.maxAmount))
       C.minPct.value = String(Math.round(Number(c.minProbability) * 1000) / 10)
-      C.pushEnabled.checked = c.pushEnabled !== false
-      C.mainSessionOnly.checked = c.mainSessionOnly === true
-      C.pollMs.value = String(c.pollMs != null ? c.pollMs : 2000)
-      C.prefix.value = String(c.prefix == null ? '-¥' : c.prefix)
-      C.decimals.value = String(c.decimals != null ? c.decimals : 2)
-      C.color.value = String(c.color || '#ff3b30')
-      C.strokeColor.value = String(c.strokeColor || '#ffffff')
-      C.strokeWidth.value = String(c.strokeWidth != null ? c.strokeWidth : 3)
-      C.fontSizePx.value = String(c.fontSizePx != null ? c.fontSizePx : 30)
-      C.risePx.value = String(c.risePx != null ? c.risePx : 96)
       C.riseMs.value = String(c.riseMs != null ? c.riseMs : 1800)
       C.jitterPct.value = String(Math.round(Number(c.jitterX != null ? c.jitterX : 0.18) * 100))
-      C.maxStack.value = String(c.maxStack != null ? c.maxStack : 6)
       syncModeEnabled()
-      redraw()
     }
 
     function doSave() {
@@ -604,36 +364,7 @@
       })
     }
 
-    function refreshStatus() {
-      try {
-        var rt = hook.getRuntime()
-        var s;
-        if (rt.sseState === 'ready') s = '推送:已连接'
-        else if (rt.sseState === 'connecting') s = '推送:连接中'
-        else if (rt.sseState === 'reconnecting') s = '推送:重连中(暂时靠轮询)'
-        else if (rt.sseState === 'unsupported') s = '推送:浏览器不支持 EventSource(靠轮询)'
-        else s = '推送:已关闭'
-        if (rt.mode === 'working') {
-          // 持续模式下最要紧的自查:宿主到底认没认出"在干活",以及上一轮金额有没有拿到
-          s += '　·　工作中:' + (rt.working ? '是' : '否')
-            + '　·　间隔 ' + rt.tickSec + 's'
-            + '　·　上一轮金额 ' + (rt.lastKnownAmount === null ? '未知(先跑完一轮)' : fenText(rt.lastKnownAmount))
-        }
-        s += '　·　兜底轮询 ' + rt.pollMs + 'ms　·　本次已触发 ' + rt.triggers + ' 次'
-          + (rt.lastTrigger ? '(最近:' + rt.lastTrigger + ')' : '')
-        setText(C.status, s)
-      } catch (err) { setText(C.status, '') }
-    }
-
-    // 区间/概率一变就重画曲线
-    var inputs = [C.minFen, C.maxFen, C.minPct]
-    for (var k = 0; k < inputs.length; k++) {
-      inputs[k].addEventListener('input', redraw)
-      inputs[k].addEventListener('change', redraw)
-    }
-
     fill(base)
-    refreshStatus()
 
     mask.appendChild(card)
     mask.addEventListener('click', function (e) { if (e.target === mask) closeCard() })
@@ -644,7 +375,6 @@
     openCard = {
       mask: mask,
       unregister: unregister,
-      timer: setInterval(refreshStatus, 1000),
     }
     return true
   }
@@ -816,7 +546,7 @@
       hook = window.__dshDmgNumber
       hook.openPanel = openPanel
       hook.panel = {
-        fenOf: fenOf, yuanOf: yuanOf, probAt: probAt, curvePoints: curvePoints,
+        fenOf: fenOf, yuanOf: yuanOf, probAt: probAt,
         pct: pct, fenText: fenText, summaryText: summaryText, buildPatch: buildPatch,
         open: openPanel, close: closeCard, tryInject: tryInject, isOpen: function () { return !!openCard },
         entry: function () { return entryRow },

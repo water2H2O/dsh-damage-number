@@ -315,7 +315,7 @@ async function main() {
   near(P.yuanOf(P.fenOf(0.077)), 0.077, 1e-9, '元 → 分 → 元 往返无损')
   eq(P.fenText(0.01), '1 分', 'fenText(0.01)')
 
-  section('4. 概率公式与曲线')
+  section('4. 概率公式')
   eq(P.probAt(0.005, 0.01, 0.1, 0.25), 0, '低于下限 → 0')
   near(P.probAt(0.01, 0.01, 0.1, 0.25), 0.25, 1e-9, '下限处 → minProbability')
   near(P.probAt(0.055, 0.01, 0.1, 0.25), 0.625, 1e-9, '中点 → 0.625')
@@ -323,39 +323,37 @@ async function main() {
   eq(P.probAt(9, 0.01, 0.1, 0.25), 1, '超过上限 → 1')
   eq(P.probAt(0.05, 0.05, 0.05, 0), 1, '上下限相等(纯阈值)→ 达到即 1')
   eq(P.probAt(0.04, 0.05, 0.05, 0), 0, '纯阈值模式下差一点 → 0')
-  const pts = P.curvePoints(0.01, 0.1, 0.25, 24)
-  eq(pts.length, 25, '曲线采样 25 个点')
-  near(pts[0].p, 0.25, 1e-9, '曲线起点 = 下限处概率')
-  eq(pts[pts.length - 1].p, 1, '曲线终点 = 100%')
-  let mono = true
-  for (let i = 1; i < pts.length; i++) if (pts[i].p < pts[i - 1].p - 1e-12) mono = false
-  ok(mono, '曲线单调不减')
-  eq(P.curvePoints(0.05, 0.05, 0).length, 3, '阈值模式曲线退化为 3 点折线')
+  eq(P.curvePoints, undefined, '概率曲线的采样函数已随界面一起删掉(不留死代码)')
 
   section('5. 摘要文本')
   eq(P.summaryText({ enabled: false }), '已关闭', '关闭时摘要显示「已关闭」')
   eq(P.summaryText({ enabled: true, minAmount: 0.02, maxAmount: 0.2, minProbability: 0.5 }),
     '2 分–20 分 · 50%→100%', '自定义配置的摘要')
 
-  section('6. 保存载荷换算与夹取')
+  section('6. 保存载荷换算与夹取(只产出界面暴露的键)')
   const patch = P.buildPatch({
     enabled: true, mode: 'working', tickSec: 7, minFen: 2, maxFen: 20, minPct: 50,
-    pushEnabled: true, mainSessionOnly: false, pollMs: 10,
-    prefix: '-¥', decimals: 2, color: '#ff3b30', strokeColor: '#ffffff', strokeWidth: 3,
-    fontSizePx: 30, risePx: 96, riseMs: 1800, jitterPct: 18, maxStack: 6,
+    riseMs: 1800, jitterPct: 18,
+    // 下面这些界面上已经没有控件了,故意一起传进来,验证它们不会被写进补丁
+    pushEnabled: false, mainSessionOnly: true, pollMs: 10, prefix: 'X', decimals: 5,
+    color: '#000000', strokeColor: '#111111', strokeWidth: 9, fontSizePx: 99,
+    risePx: 5, maxStack: 19,
   })
   eq(patch.minAmount, 0.02, '下限 2 分 → minAmount 0.02 元')
   eq(patch.maxAmount, 0.2, '上限 20 分 → maxAmount 0.2 元')
   eq(patch.minProbability, 0.5, '50% → minProbability 0.5')
-  eq(patch.pollMs, 250, '轮询间隔低于下限时被夹到 250ms')
   eq(patch.mode, 'working', '模式原样带上')
   eq(patch.tickSec, 7, '间隔原样带上')
   eq(patch.jitterX, 0.18, '界面填 18% → jitterX 0.18')
+  eq(patch.riseMs, 1800, '显示时长原样带上')
+  ok(!('pollMs' in patch) && !('prefix' in patch) && !('maxStack' in patch),
+    '界面之外的键一律不进补丁(否则会把用户手改的配置冲掉)')
+  eq(Object.keys(patch).length, 8, '补丁恰好只有这 8 个键', Object.keys(patch).join(','))
   eq(P.buildPatch({ jitterPct: 100 }).jitterX, 1, '横向偏移 100% → jitterX 1')
   eq(P.buildPatch({ mode: '乱填' }).mode, 'turnEnd', '非法模式回落到 turnEnd')
   eq(P.buildPatch({ tickSec: 99999 }).tickSec, 3600, '间隔超上限被夹到 3600s')
   eq(P.buildPatch({ tickSec: 0 }).tickSec, 5, '间隔填 0 → 回落默认 5s')
-  eq(P.buildPatch({ pollMs: 999999 }).pollMs, 60000, '轮询间隔超上限时被夹到 60000ms')
+  eq(P.buildPatch({ riseMs: 100 }).riseMs, 200, '显示时长低于下限被夹到 200ms')
   eq(P.buildPatch({ minPct: 300 }).minProbability, 1, '概率 >100% 被夹到 1')
 
   section('7. 打开设置卡片')
@@ -369,57 +367,53 @@ async function main() {
   const myCard = myMask.querySelector('.dshwv-bubcard')
   ok(!!myCard, '卡片本体存在')
   ok(allText(myCard).indexOf('受击提示设置') >= 0, '卡片标题正确')
-  ok(allText(myCard).indexOf('跳动规则') >= 0, '含「跳动规则」区块')
-  ok(allText(myCard).indexOf('概率曲线') >= 0, '含概率曲线区块')
-  ok(allText(myCard).indexOf('外观') >= 0, '含「外观」区块')
 
   const numInputs = myCard.querySelectorAll('input').filter((i) => i.type === 'number')
   eq(numInputs[0].value, '1', '下限输入框预填 1 分')
   eq(numInputs[1].value, '10', '上限输入框预填 10 分')
   eq(numInputs[2].value, '25', '概率输入框预填 25%')
-  const svg = myCard.querySelectorAll('svg')[0]
-  ok(!!svg && String(svg.innerHTML).indexOf('<path') >= 0, '概率曲线已绘制(<path> 存在)')
 
-  section('7b. 基础项在外面 + 高级默认折起')
-  const modeSel = myCard.querySelectorAll('select')[0]
-  ok(!!modeSel, '模式下拉在卡片里')
-  eq(modeSel.value, 'turnEnd', '默认是「每轮结束时」')
-  eq(modeSel.children.length, 2, '两个模式选项')
-  eq(numInputs[3].value, '5', '间隔输入框预填 5 秒')
+  section('7b. 界面瘦身:只留 6 个数字框 + 1 个下拉 + 4 个按钮')
+  // ⚠️ 这一节是"反向守卫":它钉住的是**不该出现在界面里的东西**。
+  // 以后想加回某个控件,必须先想清楚是不是又把它塞回面板了。
+  eq(numInputs.length, 6, '数字输入框恰好 6 个(区间2 + 概率 + 间隔 + 时长 + 偏移)')
+  eq(numInputs[3].value, '5', '间隔预填 5 秒')
   eq(numInputs[3].disabled, true, '「每轮结束时」模式下间隔不可用')
-  eq(numInputs[5].value, '1800', '显示时长预填 1800ms(已放慢)')
-  eq(numInputs[6].value, '18', '横向偏移按百分比展示(默认 18%)')
-  ok(allText(myCard).indexOf('每轮结束时按上面的区间概率跳一次') >= 0, '基础区说明了当前模式的规则')
+  eq(numInputs[4].value, '1800', '显示时长预填 1800ms')
+  eq(numInputs[5].value, '18', '横向偏移按百分比展示(默认 18%)')
 
-  // 高级区:内容在折叠体里,且默认 display:none
-  const advBody = myCard.querySelectorAll('div').filter((d) => d.style && d.style.display === 'none'
-    && d.querySelectorAll('input').filter((i) => i.type === 'number').length > 0)[0]
-  ok(!!advBody, '找到了默认折起的高级区(里面有数字控件)')
-  ok(advBody.querySelectorAll('input').filter((i) => i.type === 'number').length >= 5,
-    '高级区里确实装着描边/文本/上浮/同屏/轮询等控件')
+  const sels = myCard.querySelectorAll('select')
+  eq(sels.length, 1, '只有 1 个下拉(模式)')
+  eq(sels[0].children.length, 2, '模式有两个选项')
+  eq(sels[0].value, 'turnEnd', '默认「每轮结束时」')
+
+  const allBtns = myCard.querySelectorAll('button')
+  eq(allBtns.length, 4, '按钮恰好 4 个(预览 / 取消 / 恢复默认 / 保存)', allBtns.map((b) => b.textContent).join('/'))
+
+  eq(myCard.querySelectorAll('svg').length, 0, '概率曲线已移出界面')
+  eq(myCard.querySelectorAll('input').filter((i) => i.type === 'color').length, 0, '取色控件已移出界面')
+  eq(myCard.querySelectorAll('input').filter((i) => i.type === 'text').length, 0, '文本输入已移出界面')
+  eq(myCard.querySelectorAll('div').filter((d) => d.style && d.style.display === 'none'
+    && d.querySelectorAll('input').length > 0).length, 0, '没有"默认折起"的分组了(内容直接拿掉,不是藏起来)')
+  ok(allText(myCard).indexOf('高级') < 0, '不再有「高级」折叠区')
+  ok(allText(myCard).indexOf('触发通道') < 0, '「触发通道」已移出界面')
+  ok(allText(myCard).indexOf('描边') < 0, '描边设置已移出界面')
+  ok(allText(myCard).indexOf('试算') < 0, '试算已移出界面')
+  ok(allText(myCard).indexOf('每轮结束时按区间概率跳一次') >= 0, '保留了当前模式的规则说明')
 
   // 切换模式:说明文字与间隔可用性都要跟着变
-  modeSel.value = 'working'
-  modeSel.__fire('change')
+  sels[0].value = 'working'
+  sels[0].__fire('change')
   eq(numInputs[3].disabled, false, '切到持续模式后间隔可用了')
-  ok(allText(myCard).indexOf('无条件跳一次') >= 0, '说明文字切换成持续模式的规则')
+  ok(allText(myCard).indexOf('干活期间每 5 秒跳一次') >= 0, '说明文字切换成持续模式的规则')
 
   section('8. 预览按钮不花钱')
   const before = hook.getRuntime().onScreen
   const previewBtns = myCard.querySelectorAll('button').filter((b) => String(b.textContent).indexOf('预览') === 0)
-  eq(previewBtns.length, 3, '有 3 个预览按钮(下限/中点/上限)')
+  eq(previewBtns.length, 1, '只剩 1 个预览按钮')
   previewBtns[0].__fire('click')
-  eq(hook.getRuntime().onScreen, before + 1, '点「预览下限」后就地飘出一个数字(未发任何请求)')
+  eq(hook.getRuntime().onScreen, before + 1, '点「预览一下」后就地飘出一个数字(未发任何请求)')
   eq(S.net.puts.length, 0, '预览不产生任何写请求')
-
-  section('9. 试算按钮验证概率')
-  const simInputs = myCard.querySelectorAll('input').filter((i) => i.type === 'number')
-  simInputs[12].value = '10'     // 试算金额 = 上限 10 分
-  simInputs[13].value = '1000'   // 掷 1000 次
-  const runBtn = myCard.querySelectorAll('button').filter((b) => String(b.textContent) === '跑')[0]
-  ok(!!runBtn, '找到「跑」按钮')
-  runBtn.__fire('click')
-  ok(allText(myCard).indexOf('1000/1000') >= 0, '上限金额试算 1000 次全部命中', allText(myCard).slice(-80))
 
   section('10. 保存:PUT 载荷正确 + 入口行摘要刷新')
   const okBtn = myCard.querySelectorAll('button').filter((b) => String(b.textContent) === '保存')[0]
@@ -433,28 +427,25 @@ async function main() {
   eq(S.net.puts[0].minProbability, 0.4, 'PUT 载荷:概率 = 0.4')
   eq(S.net.puts[0].enabled, true, 'PUT 载荷:开关保留')
   eq(S.net.puts[0].mode, 'working', 'PUT 载荷:模式带上了刚才选的持续模式')
+  ok(S.net.puts[0].pushEnabled === true && S.net.puts[0].pollMs === 2000,
+    '界面外的键由现有配置兜底,原样保留(不会被这次保存清掉)')
   eq(hook.getConfig().minAmount, 0.02, '保存成功后本地配置立即生效')
   eq(hook.getConfig().mode, 'working', '本地配置的模式也立刻生效')
-  eq(hook.getRuntime().pollMs, 2000, '未改动的轮询间隔保持 2000ms')
   eq(entry.__summary.textContent, '2 分–10 分 · 40%→100%', '入口行摘要跟着刷新')
   ok(!hook.panel.isOpen(), '保存成功后卡片自动关闭')
 
-  section('10b. 轮询间隔的夹取是端到端生效的(界面 → 载荷 → 重建定时器)')
+  section('10b. 间隔的夹取是端到端生效的(界面 → 载荷 → 运行时)')
   hook.panel.open()
   const card2 = S.body.querySelectorAll('.dshwv-bubmask')
     .filter((m) => m.getAttribute('data-dsh-dmg'))[0].querySelector('.dshwv-bubcard')
   const ni2 = card2.querySelectorAll('input').filter((i) => i.type === 'number')
-  // 守卫:曾经真的踩过「控件 new 出来了、却忘了 appendChild 进那一行」——
-  // 结果界面上少一个输入框,而 collect() 永远读到默认值,静默失效。
-  // 顺序:0下限 1上限 2概率 3间隔 4字号 5时长 6横向偏移 | 高级:7轮询 8描边宽 9小数位 10上浮 11同屏 | 试算:12金额 13次数
-  eq(ni2.length, 14, '卡片里的数字输入框数量正确(少一个就说明有控件没挂进 DOM)')
-  eq(ni2[7].value, '2000', '轮询间隔输入框真的在 DOM 里(第 8 个数字控件)')
-  ni2[7].value = '100'
+  eq(ni2.length, 6, '数字控件仍然是 6 个')
+  ni2[3].value = '0.1'           // 间隔填到下限以下
   card2.querySelectorAll('button').filter((b) => String(b.textContent) === '保存')[0].__fire('click')
   await flush(); await flush()
   eq(S.net.puts.length, 2, '第二次保存发出了 PUT')
-  eq(S.net.puts[1].pollMs, 250, '界面填 100ms → 载荷被夹到 250ms')
-  eq(hook.getRuntime().pollMs, 250, '夹取结果真的落到了重建后的定时器上')
+  eq(S.net.puts[1].tickSec, 0.5, '界面填 0.1 秒 → 载荷被夹到 0.5 秒')
+  eq(hook.getConfig().tickSec, 0.5, '夹取结果真的落到了本地配置上')
   ok(!hook.panel.isOpen(), '第二次保存后卡片也关闭了')
 
   section('10c. 宿主把键丢掉时,面板要明说"重启客户端"而不是静默成功')

@@ -586,7 +586,7 @@
   }
 
   var hook = {
-    version: '0.3.0',
+    version: '0.3.1',
     DEFAULT_CFG: DEFAULT_CFG,
     getConfig: function () { return Object.assign({}, cfg) },
     setConfig: function (patch) { return applyConfig(Object.assign({}, cfg, patch || {})) },
