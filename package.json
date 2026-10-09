@@ -1,8 +1,8 @@
 {
   "name": "dsh-damage-number",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "DSH 挂件:每轮对话消耗进入设定区间后,按概率在小鲸鱼头顶弹出红色伤害数字(达到区间上限必定弹出)",
+  "description": "DSH 挂件:每轮对话消耗进入设定区间后,按概率在小鲸鱼头顶弹出红色伤害数字(达到区间上限必定弹出);宿主 SSE 即时推送、可视化设置面板、预览与试算无需花钱",
   "keywords": [
     "dsh",
     "dsh-plugin",

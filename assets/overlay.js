@@ -1,17 +1,25 @@
 // ============================================================================
-// dsh-damage-number —— 浏览器半区
+// dsh-damage-number —— 浏览器半区(核心)
 // ============================================================================
 // 每轮对话结束后,按「区间 + 随机」规则在小鲸鱼头顶弹出一个红色伤害数字。
 //
-// 数据源:小鲸鱼挂件的 /dsh-whale/last-turn.json → { ok, seq, turn, amount, tokens, ts }
+// 金额来源(唯一真相):小鲸鱼挂件的 /dsh-whale/last-turn.json → { ok, seq, turn, amount, tokens, ts }
 //   seq 每完成一轮递增,所以"seq 变大"就是"又花了一轮钱"的触发信号。
 //   挂件没装 / 路由 404 时,这里只是安静地什么都不做(不报错、不刷屏)。
+//
+// 触发时机(两条通道,谁先到算谁):
+//   ① 宿主 SSE /dsh-dmg/events —— 宿主在 turn/end 的**同一刻**广播;收到就立刻取数。
+//      延迟 ≈ 一次本机往返(几毫秒)。这是手感的关键:金额是挂件算的,宿主只负责"叫醒"。
+//   ② 兜底轮询 cfg.pollMs(默认 2s)—— SSE 断开/不可用/被关掉时才唱主角。
+//   SSE 重连成功(onopen)也会立刻取一次,断线期间的缺口由此补上。
 //
 // 触发规则(与本插件宿主半区的 DEFAULT_CONFIG 必须一致):
 //   amount <  minAmount            → 不跳
 //   minAmount <= amount < maxAmount → 概率 = minProbability + (1-minProbability) * 区间内进度
 //   amount >= maxAmount            → 必定跳
 // 这正是"伤害有上下限、多数时候随机、暴击必定触发"的手感。
+//
+// 设置界面在 assets/panel.js(它等这里的 window.__dshDmgNumber 就绪后再挂上去)。
 // ============================================================================
 
 (function () {
@@ -22,15 +30,20 @@
 
   var ENDPOINT_TURN = '/dsh-whale/last-turn.json'
   var ENDPOINT_CFG = '/dsh-dmg/config.json'
-  var POLL_MS = 1000
+  var ENDPOINT_EVENTS = '/dsh-dmg/events'
   var CFG_REFRESH_MS = 30000
   var LAYER_ID = 'dsh-dmg-layer'
+  var MIN_POLL_MS = 250
+  var MAX_POLL_MS = 60000
 
   var DEFAULT_CFG = {
     enabled: true,
     minAmount: 0.01,
     maxAmount: 0.1,
     minProbability: 0.25,
+    pushEnabled: true,
+    mainSessionOnly: false,
+    pollMs: 2000,
     prefix: '-¥',
     decimals: 2,
     color: '#ff3b30',
@@ -51,8 +64,14 @@
   // 不会漏掉**在页面不在时结束的那一轮 —— 挂件自己也是这个策略(它读 dshw-last-seq)。
   var baseline = null
   var SEQ_KEY = 'dshw-dmg-last-seq'
-  var stack = []       // 正在飘的节点,满了就丢掉最旧的
+  var stack = []        // 正在飘的节点,满了就丢掉最旧的
   var timers = []
+  var es = null         // EventSource
+  var esReady = false
+  var pollTimer = null
+  var curPollMs = 0
+  var configWatchers = []
+  var runtime = { lastTickAt: 0, lastTrigger: '', triggers: 0, sseState: 'off' }
 
   function readStoredSeq() {
     try {
@@ -73,6 +92,12 @@
   function clamp01(v) {
     if (!isFinite(v)) return 0
     return v < 0 ? 0 : (v > 1 ? 1 : v)
+  }
+  function clampPollMs(v) {
+    var n = Math.round(num(v, 2000))
+    if (n < MIN_POLL_MS) n = MIN_POLL_MS
+    if (n > MAX_POLL_MS) n = MAX_POLL_MS
+    return n
   }
 
   // ---- 落点:鲸鱼精灵图(.dshwv-img)的头顶 ----
@@ -234,22 +259,53 @@
       })
   }
 
+  function notifyConfig() {
+    for (var i = 0; i < configWatchers.length; i++) {
+      try { configWatchers[i](Object.assign({}, cfg)) } catch (err) {}
+    }
+  }
+
+  function applyConfig(next) {
+    cfg = Object.assign({}, DEFAULT_CFG, next || {})
+    hook.cfg = cfg
+    syncPoll()
+    syncPush()
+    notifyConfig()
+    return cfg
+  }
+
   function loadConfig() {
     return fetchJson(ENDPOINT_CFG)
       .then(function (d) {
         // 只在拿到**对象**时才应用:404 / 断连 / 畸形载荷一律保留上一次有效配置。
         // 绝不因为一次读失败就把用户调好的区间静默冲回默认值 —— 宿主那边读不到配置时
         // 返回的本来就是"默认值 + 磁盘覆盖"的完整对象,客户端不需要自己兜底重置。
-        if (d && typeof d === 'object') {
-          cfg = Object.assign({}, DEFAULT_CFG, d)
-          hook.cfg = cfg
-        }
+        if (d && typeof d === 'object') applyConfig(d)
       })
       .catch(function () {})
   }
 
-  // 跑一次轮询。返回:null = 无事发生;{...} = 本次判定结果(便于测试与调试)
-  function tick() {
+  // 面板保存:写到宿主(宿主只接受本机回环的写请求),成功后立刻在本地生效
+  function saveConfig(patch) {
+    return fetch(ENDPOINT_CFG, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      cache: 'no-store',
+      body: JSON.stringify(Object.assign({}, cfg, patch || {})),
+    }).then(function (r) {
+      if (!r || !r.ok) throw new Error('HTTP ' + (r && r.status))
+      return r.json()
+    }).then(function (d) {
+      if (!d || d.ok !== true) throw new Error((d && d.error) || '保存被拒绝')
+      applyConfig(d.config)
+      return d.config
+    })
+  }
+
+  // 取一次数。返回:null = 无事发生;{...} = 本次判定结果(便于测试与调试)
+  function tick(source) {
+    runtime.lastTickAt = Date.now()
     return fetchJson(ENDPOINT_TURN)
       .then(function (d) {
         if (!d || !d.ok || typeof d.seq !== 'number') return null
@@ -279,25 +335,133 @@
         if (cfg.enabled === false) return null
         var amount = num(d.amount, 0)
         var res = rollDamage(amount)
+        res.source = source || 'poll'
+        res.amount = amount
+        res.seq = seq
         if (!res.hit) return res
+        runtime.triggers++
+        runtime.lastTrigger = res.source
         spawn(amount)
         return res
       })
       .catch(function () { return null })
   }
 
+  // ---- 兜底轮询 ----
+  function syncPoll() {
+    var want = clampPollMs(cfg.pollMs)
+    if (pollTimer && curPollMs === want) return
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+    curPollMs = want
+    pollTimer = setInterval(function () { tick('poll') }, want)
+    timers.push(pollTimer)
+  }
+
+  // ---- SSE:宿主在 turn/end 的同一刻叫醒我们 ----
+  function stopPush() {
+    if (es) {
+      try { es.close() } catch (err) {}
+      es = null
+    }
+    esReady = false
+    runtime.sseState = 'off'
+  }
+
+  function syncPush() {
+    if (cfg.pushEnabled === false) { stopPush(); return }
+    if (es) return
+    if (typeof window.EventSource !== 'function') {
+      runtime.sseState = 'unsupported'
+      return
+    }
+    try {
+      es = new window.EventSource(ENDPOINT_EVENTS)
+    } catch (err) {
+      es = null
+      runtime.sseState = 'error'
+      return
+    }
+    runtime.sseState = 'connecting'
+    es.addEventListener('hello', function () {
+      esReady = true
+      runtime.sseState = 'ready'
+    })
+    es.addEventListener('turn', function (ev) {
+      var d = null
+      try { d = JSON.parse(ev.data) } catch (err) { d = null }
+      // 「只在主会话结算」:子代理的 turn/end 不当成一整轮对话
+      if (cfg.mainSessionOnly === true && d && d.isSubagent) return
+      tick('push')
+    })
+    // 重连成功也立刻取一次:断线期间结束的轮次由此补上,不依赖下一次轮询
+    es.onopen = function () {
+      esReady = true
+      runtime.sseState = 'ready'
+      tick('push-open')
+    }
+    es.onerror = function () {
+      // EventSource 自己会重连;这里只标记状态,让面板能显示"已降级为轮询"
+      esReady = false
+      runtime.sseState = 'reconnecting'
+    }
+  }
+
+  // 面板"预览"按钮用:不走判定,直接飘一个
+  function preview(amount) {
+    return spawn(num(amount, 0.05))
+  }
+
+  // 面板"试算"按钮用:按当前区间跑 N 次判定,返回命中次数与理论概率
+  function simulate(amount, times) {
+    var n = Math.max(1, Math.min(20000, Math.round(num(times, 1000))))
+    var a = num(amount, 0)
+    var hits = 0
+    var p = 0
+    for (var i = 0; i < n; i++) {
+      var r = rollDamage(a)
+      p = r.p
+      if (r.hit) hits++
+    }
+    return { amount: a, times: n, hits: hits, rate: hits / n, expected: p }
+  }
+
   var hook = {
-    version: '0.1.0',
+    version: '0.2.0',
+    DEFAULT_CFG: DEFAULT_CFG,
     getConfig: function () { return Object.assign({}, cfg) },
-    setConfig: function (patch) { cfg = Object.assign({}, cfg, patch || {}); hook.cfg = cfg; return hook.getConfig() },
+    setConfig: function (patch) { return applyConfig(Object.assign({}, cfg, patch || {})) },
+    applyConfig: applyConfig,
+    loadConfig: loadConfig,
+    saveConfig: saveConfig,
+    onConfigChange: function (fn) {
+      if (typeof fn !== 'function') return function () {}
+      configWatchers.push(fn)
+      return function () {
+        var i = configWatchers.indexOf(fn)
+        if (i >= 0) configWatchers.splice(i, 1)
+      }
+    },
     roll: rollDamage,
     spawn: spawn,
+    preview: preview,
+    simulate: simulate,
     tick: tick,
-    loadConfig: loadConfig,
     headPoint: headPoint,
     reset: function () { baseline = null; return true },
     clearStoredSeq: function () { try { window.localStorage.removeItem(SEQ_KEY) } catch (err) {} baseline = null; return true },
     getBaseline: function () { return baseline },
+    getRuntime: function () {
+      return {
+        sseReady: esReady,
+        sseState: runtime.sseState,
+        pollMs: curPollMs,
+        lastTickAt: runtime.lastTickAt,
+        triggers: runtime.triggers,
+        lastTrigger: runtime.lastTrigger,
+        baseline: baseline,
+        onScreen: stack.length,
+      }
+    },
     cfg: cfg,
   }
   window.__dshDmgNumber = hook
@@ -305,8 +469,9 @@
   function start() {
     ensureLayer()
     loadConfig().then(function () {
-      tick()
-      timers.push(setInterval(tick, POLL_MS))
+      tick('boot')
+      syncPoll()
+      syncPush()
       timers.push(setInterval(loadConfig, CFG_REFRESH_MS))
     })
   }

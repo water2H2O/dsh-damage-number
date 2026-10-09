@@ -8,9 +8,10 @@
 // ============================================================================
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import vm from 'node:vm'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const OVERLAY = path.resolve(HERE, '..', 'assets', 'overlay.js')
@@ -65,8 +66,32 @@ function makeStorage() {
   }
 }
 
+// 可控的 EventSource 打桩:记录实例,并允许手动触发 hello/turn/onopen/onerror
+function makeEventSourceStub() {
+  const instances = []
+  function ES(url) {
+    const listeners = {}
+    const inst = {
+      url: url, closed: false, onopen: null, onerror: null,
+      addEventListener(t, fn) { (listeners[t] = listeners[t] || []).push(fn) },
+      close() { inst.closed = true },
+      __fire(t, data) {
+        const list = listeners[t] || []
+        for (const fn of list) fn({ data: typeof data === 'string' ? data : JSON.stringify(data) })
+      },
+      __open() { if (inst.onopen) inst.onopen() },
+      __error() { if (inst.onerror) inst.onerror() },
+    }
+    instances.push(inst)
+    return inst
+  }
+  ES.instances = instances
+  return ES
+}
+
 function makeHarness(opts) {
   const storage = (opts && opts.storage) || makeStorage()
+  const ES = (opts && opts.eventSource) || null
   const state = {
     turn: { ok: true, seq: 0, amount: null, tokens: null, ts: null },
     turnFail: false,
@@ -124,6 +149,7 @@ function makeHarness(opts) {
   }
 
   const ctx = vm.createContext(sandbox)
+  if (ES) sandbox.window.EventSource = ES
   vm.runInContext('globalThis.__randQueue = []; Math.random = function () {'
     + ' return globalThis.__randQueue.length ? globalThis.__randQueue.shift() : 0.5; };', ctx)
   // 拿到上下文里那个数组的**真实引用**,避免跨 realm 属性同步的不确定性
@@ -133,7 +159,7 @@ function makeHarness(opts) {
   vm.runInContext(fs.readFileSync(OVERLAY, 'utf8'), ctx, { filename: 'overlay.js' })
 
   return {
-    state, sandbox, ctx, body, whaleImg, setRand, storage,
+    state, sandbox, ctx, body, whaleImg, setRand, storage, ES,
     hook: sandbox.window.__dshDmgNumber,
     layer: () => document.getElementById('dsh-dmg-layer'),
   }
@@ -335,6 +361,7 @@ async function main() {
   // lib/index.js 的 DEFAULT_CONFIG 与 assets/overlay.js 的 DEFAULT_CFG 是两份独立字面量,
   // 一个"全新安装的默认值"、一个"取不到配置时的兜底"。它们一旦漂移,行为就会在
   // "装了插件"和"配置读失败"两种情况下不一样 —— 这条断言专门钉住这个风险。
+  // 真实现与两份默认值都在 lib/index.js(宿主半区单文件,与 dsh-whale-widget 同结构)
   const hostSrc = fs.readFileSync(path.resolve(HERE, '..', 'lib', 'index.js'), 'utf8')
   function extractObjectLiteral(src, marker) {
     const i = src.indexOf(marker)
@@ -364,6 +391,210 @@ async function main() {
   }
   eq(drift.length, 0, '两侧默认值逐字段一致', drift.join(' | '))
   eq(hostCfg.maxAmount, 0.1, '（抽查)宿主默认区间上限 = 0.1')
+
+  section('18. SSE 推送:turn/end 即时触发')
+  const E1 = makeEventSourceStub()
+  const S1 = makeHarness({ eventSource: E1 })
+  S1.state.turn = { ok: true, seq: 1, amount: 0.5, tokens: 1, ts: 1 }
+  await flush(); await flush()
+  eq(E1.instances.length, 1, '建立了 1 条 SSE 连接')
+  eq(E1.instances[0].url, '/dsh-dmg/events', '连到 /dsh-dmg/events')
+  eq(S1.hook.getRuntime().sseState, 'connecting', '建连后先标记「连接中」')
+  const es1 = E1.instances[0]
+  es1.__fire('hello', { ok: true, version: '0.2.0' })
+  eq(S1.hook.getRuntime().sseReady, true, '收到 hello 握手帧 → 通道确认可用')
+  eq(S1.hook.getRuntime().sseState, 'ready', '状态变为 ready')
+  eq(S1.layer().children.length, 0, '握手本身不会凭空生成数字')
+
+  S1.state.turn = { ok: true, seq: 2, amount: 0.5, tokens: 1, ts: 2 }
+  es1.__fire('turn', { isSubagent: false, turn: 2 })
+  await flush(); await flush()
+  eq(S1.layer().children.length, 1, '收到 turn 事件后立刻取数并触发(上限金额必跳)')
+  eq(S1.hook.getRuntime().lastTrigger, 'push', '触发来源记为 push(而不是 poll)')
+
+  section('19. SSE 重连也会补一次,断线不丢轮次')
+  S1.state.turn = { ok: true, seq: 3, amount: 0.5, tokens: 1, ts: 3 }
+  es1.__error()
+  eq(S1.hook.getRuntime().sseState, 'reconnecting', 'onerror → 状态为「重连中」(靠轮询顶着)')
+  es1.__open()
+  await flush(); await flush()
+  eq(S1.hook.getRuntime().sseReady, true, '重连成功后恢复 ready')
+  eq(S1.layer().children.length, 2, '重连时立刻补取了断线期间结束的那一轮')
+
+  section('20. mainSessionOnly:子代理轮次不当成一整轮对话')
+  const E2 = makeEventSourceStub()
+  const S2 = makeHarness({ eventSource: E2 })
+  S2.state.turn = { ok: true, seq: 10, amount: 0.5, tokens: 1, ts: 1 }
+  await flush(); await flush()
+  S2.hook.setConfig({ mainSessionOnly: true })
+  const es2 = E2.instances[0]
+  eq(es2.closed, false, '改配置不会把已有连接关掉')
+
+  S2.state.turn = { ok: true, seq: 11, amount: 0.5, tokens: 1, ts: 2 }
+  es2.__fire('turn', { isSubagent: true, turn: 11 })
+  await flush(); await flush()
+  eq(S2.layer().children.length, 0, '子代理的 turn/end 不即时触发')
+
+  S2.state.turn = { ok: true, seq: 12, amount: 0.5, tokens: 1, ts: 3 }
+  es2.__fire('turn', { isSubagent: false, turn: 12 })
+  await flush(); await flush()
+  eq(S2.layer().children.length, 1, '主会话的 turn/end 照常即时触发')
+
+  section('21. pushEnabled 可关闭、可再打开')
+  const E3 = makeEventSourceStub()
+  const S3 = makeHarness({ eventSource: E3 })
+  await flush(); await flush()
+  eq(E3.instances.length, 1, '默认开启推送 → 建立连接')
+  S3.hook.setConfig({ pushEnabled: false })
+  eq(E3.instances[0].closed, true, '关闭推送 → 连接被关闭')
+  eq(S3.hook.getRuntime().sseState, 'off', '状态为 off(此时全靠轮询)')
+  S3.hook.setConfig({ pushEnabled: true })
+  eq(E3.instances.length, 2, '再次开启 → 重新建立连接')
+
+  section('22. 浏览器不支持 EventSource 时安静退化')
+  const S4 = makeHarness()   // 不给 EventSource
+  await flush(); await flush()
+  eq(S4.hook.getRuntime().sseState, 'unsupported', '没有 EventSource → 标记 unsupported')
+  eq(S4.hook.getRuntime().pollMs, 2000, '兜底轮询照常存在(默认 2000ms)')
+
+  // ==========================================================================
+  // 宿主半区:真实加载 lib/index.js 并跑一遍 apply(),验证路由注册与 SSE 广播。
+  // 这是"消耗几毫秒就到"那条链路里**宿主侧**的全部关键行为。
+  // ==========================================================================
+  section('23. 宿主半区:真实加载 lib/index.js')
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dshdmg-'))
+  process.env.DSH_HOME = tmpHome   // 必须在 import 之前设置:宿主半区在模块顶层读它
+  const indexPath = path.resolve(HERE, '..', 'lib', 'index.js')
+  const hostPlugin = (await import(pathToFileURL(indexPath).href + '?t=' + Date.now())).default
+  eq(hostPlugin.name, 'damage-number', '插件名正确')
+  eq(typeof hostPlugin.apply, 'function', '暴露 apply')
+
+  section('24. 宿主半区:路由注册与订阅')
+  const routes = []
+  const taps = []
+  const listeners = {}
+  // 可切换的"宿主信任栅栏"替身:enabled 决定它存不存在,fn 决定它对请求返回什么
+  const connState = { enabled: true, fn: () => null }
+  const fakeCtx = {
+    webServer: {
+      register(route) { routes.push(route); return () => {} },
+      tapIndex(fn) { taps.push(fn); return () => {} },
+    },
+    get(name) {
+      if (name !== 'connection') return undefined
+      if (!connState.enabled) return undefined
+      return { requestRejection: (req) => connState.fn(req) }
+    },
+  }
+  const fakeRoot = {
+    effect(fn) { try { fn() } catch (err) {} return () => {} },
+    on(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); return () => {} },
+    inject(services, cb) { cb(fakeCtx) },
+  }
+  await hostPlugin.apply(fakeRoot)
+  const paths = routes.map((r) => r.path).sort()
+  eq(JSON.stringify(paths), JSON.stringify([
+    '/dsh-dmg/config.json', '/dsh-dmg/events', '/dsh-dmg/overlay.js',
+    '/dsh-dmg/panel.js', '/dsh-dmg/status.json',
+  ]), 'apply() 注册了全部 5 条路由')
+  eq((listeners['session/event'] || []).length, 1, '订阅了 session/event(turn/end 即时推送的来源)')
+  eq((listeners['webserver/index-inject'] || []).length, 1, '订阅了 webserver/index-inject(桌面端注入通道)')
+  eq(taps.length, 1, '注册了 tapIndex(web 形态注入)')
+
+  section('25. 宿主半区:SSE 连接与 turn/end 广播')
+  const eventsRoute = routes.filter((r) => r.path === '/dsh-dmg/events')[0]
+  const mkRes = () => ({
+    statusCode: 0, headers: null, frames: [], ended: false,
+    writeHead(c, h) { this.statusCode = c; this.headers = h },
+    write(s) { this.frames.push(String(s)) },
+    end() { this.ended = true },
+    on() {},
+  })
+  const sseReq = { method: 'GET', headers: { host: '127.0.0.1:3080' }, on() {} }
+  const sse = mkRes()
+  await eventsRoute.handler(sseReq, sse)
+  eq(sse.statusCode, 200, 'SSE 路由返回 200')
+  ok(String(sse.headers['Content-Type']).indexOf('text/event-stream') >= 0, 'Content-Type = text/event-stream')
+  ok(sse.frames.join('').indexOf('event: hello') >= 0, '建连先发握手帧')
+
+  const fire = (session, event) => {
+    for (const fn of listeners['session/event']) fn(session, event)
+  }
+  sse.frames.length = 0
+  fire({ id: 's1', header: {} }, { type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } })
+  const frame = sse.frames.join('')
+  ok(frame.indexOf('event: turn') >= 0, '主会话 turn/end → 立刻广播 turn 帧')
+  ok(frame.indexOf('"isSubagent":false') >= 0, '广播载荷带 isSubagent=false')
+  ok(frame.indexOf('"turn":3') >= 0, '广播载荷带轮次号')
+
+  sse.frames.length = 0
+  fire({ id: 's2', header: { origin: 'subagent' } }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  ok(sse.frames.join('').indexOf('event: turn') >= 0, '默认(不筛会话)时子代理轮次同样广播')
+  ok(sse.frames.join('').indexOf('"isSubagent":true') >= 0, '子代理轮次被正确标记')
+
+  fire({ id: 's1', header: {} }, { type: 'assistant/message', data: { turn: 1, usage: { inputTokens: 1 } } })
+  eq(sse.frames.join('').split('event: turn').length - 1, 1, '非 turn/end 的事件不广播')
+
+  section('26. 宿主半区:mainSessionOnly 让子代理不再即时触发')
+  const cfgRoute = routes.filter((r) => r.path === '/dsh-dmg/config.json')[0]
+  const putBody = JSON.stringify({ mainSessionOnly: true })
+  const putRes = mkRes()
+  await cfgRoute.handler({
+    method: 'PUT',
+    headers: { host: '127.0.0.1:3080' },
+    on(ev, fn) { if (ev === 'data') fn(Buffer.from(putBody)); if (ev === 'end') fn() },
+  }, putRes)
+  eq(putRes.statusCode, 200, 'PUT 配置返回 200')
+  const saved = JSON.parse(fs.readFileSync(path.join(tmpHome, '.dshdmg.json'), 'utf8'))
+  eq(saved.mainSessionOnly, true, '配置已落到 $DSH_HOME/.dshdmg.json')
+  eq(saved.minAmount, 0.01, '未提供的键保持默认值')
+
+  sse.frames.length = 0
+  fire({ id: 's3', header: { parentSession: 'p' } }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+  eq(sse.frames.join(''), '', 'mainSessionOnly=true 后子代理轮次不再广播')
+  fire({ id: 's4', header: {} }, { type: 'turn/end', data: { turn: 4, reason: { kind: 'completed' } } })
+  ok(sse.frames.join('').indexOf('event: turn') >= 0, '主会话仍然照常广播')
+
+  section('27. 宿主半区:信任栅栏的四种情形(与 dsh-whale-widget 同款语义)')
+  // 设计要点:宿主栅栏**可用**时,非回环 Host 交给它判 —— 它才知道 dsh 自己的 --trusted-host
+  // 声明了谁;插件只在"确实没有栅栏"时才回落到自己的回环校验(否则会把宿主已信任的权威误拒)。
+  const evilReq = { method: 'GET', headers: { host: 'evil.example.com' }, on() {} }
+  connState.enabled = true
+  connState.fn = () => null
+  const f1 = mkRes()
+  await eventsRoute.handler(evilReq, f1)
+  eq(f1.statusCode, 200, '栅栏可用且放行 → 跟随栅栏(非回环 Host 由它判)')
+
+  connState.fn = () => 401
+  const f2 = mkRes()
+  await eventsRoute.handler(evilReq, f2)
+  eq(f2.statusCode, 401, '栅栏拒绝 → 原样透传它的状态码')
+  eq(f2.frames.length, 0, '被拒的请求拿不到任何帧')
+
+  connState.fn = () => { throw new Error('fence boom') }
+  const f3 = mkRes()
+  await eventsRoute.handler(evilReq, f3)
+  eq(f3.statusCode, 403, '栅栏自己抛异常 → fail-closed 按拒绝处理(不静默放行)')
+
+  connState.enabled = false
+  const f4 = mkRes()
+  await eventsRoute.handler(evilReq, f4)
+  eq(f4.statusCode, 403, '栅栏不可用 → 插件自带校验拒绝非回环 Host')
+
+  connState.enabled = true
+  connState.fn = () => null
+  const f5 = mkRes()
+  await eventsRoute.handler({
+    method: 'GET', headers: { host: '127.0.0.1:3080', 'sec-fetch-site': 'cross-site' }, on() {},
+  }, f5)
+  eq(f5.statusCode, 403, 'cross-site 标记一律拒(与栅栏无关)')
+
+  const f6 = mkRes()
+  await eventsRoute.handler({
+    method: 'GET', headers: { host: '127.0.0.1:3080', origin: 'https://evil.example.com' }, on() {},
+  }, f6)
+  eq(f6.statusCode, 403, 'Origin 与 Host 不同源一律拒(403)')
+  try { fs.rmSync(tmpHome, { recursive: true, force: true }) } catch (err) {}
 
   console.log('\n' + '='.repeat(58))
   if (failures.length === 0) {
