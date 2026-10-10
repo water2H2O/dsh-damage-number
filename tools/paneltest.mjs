@@ -439,6 +439,8 @@ async function main() {
   sels[0].__fire('change')
   eq(numInputs[3].disabled, false, '切到持续模式后间隔可用了')
   ok(allText(myCard).indexOf('干活期间每 5 秒跳一次') >= 0, '说明文字切换成持续模式的规则')
+  ok(allText(myCard).indexOf('本轮到目前为止的真实花费') >= 0,
+    '并且明说持续模式跳的是"本轮目前为止的真实花费"(不是重复上一轮那个数)')
 
   section('8. 预览按钮不花钱')
   const before = hook.getRuntime().onScreen

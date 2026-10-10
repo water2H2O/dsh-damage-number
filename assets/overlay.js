@@ -46,6 +46,7 @@
     enabled: true,
     mode: 'turnEnd',
     tickSec: 5,
+    tickAmount: 'turnTotal',
     minAmount: 0.01,
     maxAmount: 0.1,
     minProbability: 0.25,
@@ -88,10 +89,20 @@
   var activityTimer = null
   var supervisorTimer = null
   var lastBurstAt = 0
-  // 上一次**已完成**那一轮的真实金额。「工作中持续跳动」用的就是它 ——
-  // 小鲸鱼没有暴露"本轮进行中的金额",所以这里刻意不做任何估算:宁可重复同一个真实数字,
-  // 也不显示一个编出来的数。(页面刚打开、还没读到过任何金额时,先不跳。)
+  // 上一次**已完成**那一轮的真实金额。
+  // ⚠️ 它现在只是**兜底**:宿主报不出"进行中金额"时(旧宿主 / 一条 assistant/message 都还没来)
+  // 才用它。正常情况下持续模式跳的是下面 liveAmount —— 本轮到目前为止的真实花费。
+  // (早期版本只有这个兜底值,于是整轮都在重复上一轮的数字,看起来像坏了。)
   var lastKnownAmount = null
+
+  // ---- 「本轮进行中的金额」----
+  // 由宿主按**小鲸鱼自己的公式**逐条 assistant/message 累加(见 lib/index.js 的 DMG_PRICING),
+  // 随 activity.json / activity 帧下发。所以这不是估算,而是与挂件同式的实时金额。
+  var liveAmount = null    // 本轮累计(元);null = 还没有可用数据
+  var liveTurn = null      // 它属于哪一轮(靠它识别换轮,重置增量基线)
+  var liveTokens = 0
+  var liveBaseline = 0     // intervalDelta 模式:上次跳动时已经报过的累计值
+  var liveIsMirror = false // 是否真的用上了镜像金额(供 getRuntime 自查)
 
   function readStoredSeq() {
     try {
@@ -354,6 +365,21 @@
     })
   }
 
+  // 自检:镜像计价 vs 挂件结算。
+  // 镜像的价目表/峰谷规则是**照抄**挂件源码的常量(见 lib/index.js 的 DMG_PRICING 段),
+  // 一旦官方调价或挂件换规则,抄来的那份就会悄悄变旧 —— 那正是"进行中数字不对"的隐因。
+  // 这里每轮比一次:偏差超过 5% 就点名警告,别让它静默错下去。
+  function checkLiveDrift(exactAmount) {
+    if (liveAmount === null || !(liveAmount > 0)) return
+    if (!(exactAmount > 0)) return
+    var rel = Math.abs(liveAmount - exactAmount) / exactAmount
+    if (rel <= 0.05) return
+    warnOnce('drift', '镜像计价与挂件结算不一致:我算的本轮累计 = ' + liveAmount.toFixed(6)
+      + ',挂件给的 = ' + exactAmount.toFixed(6) + ' (差 ' + Math.round(rel * 100) + '%)'
+      + ' —— 多半是官方调价了,请更新 lib/index.js 里的 DMG_PRICING / DMG_HOLIDAY_VALLEY。'
+      + '提示:结算数字取自挂件,始终是准的;只有"进行中"那串数字会偏。')
+  }
+
   // 取一次数。返回:null = 无事发生;{...} = 本次判定结果(便于测试与调试)
   function tick(source) {
     runtime.lastTickAt = Date.now()
@@ -393,6 +419,9 @@
         storeSeq(seq)
         if (cfg.enabled === false) return null
         var amount = num(d.amount, 0)
+        // 自检:把"我按挂件公式算的本轮累计"与挂件结算出来的真实金额比一次。
+        // 放在判定之前 —— 即使这一轮因概率没跳,偏差也该被报出来。
+        checkLiveDrift(amount)
         var res = rollDamage(amount)
         res.source = source || 'poll'
         res.amount = amount
@@ -428,15 +457,37 @@
     return Math.round(n * 1000)
   }
 
-  // 工作中间隔跳动:无条件跳(不做概率判定),金额 = 上一轮的真实金额。
+  // 间隔跳动要跳多少钱。三种情形,优先级从高到低:
+  //   ① 有"本轮进行中的镜像金额"→ 按 cfg.tickAmount 取本轮累计 / 增量。**这是正常路径**。
+  //   ② 完全没有镜像数据(旧宿主 / 还没收到任何 assistant/message)→ 退回上一轮真实金额。
+  //   ③ intervalDelta 模式下"这段时间没花钱"→ 返回 null,**不跳** ——
+  //      绝不能退回旧金额,否则又会看到"整轮重复同一个数"那个坏现象。
+  function burstAmount() {
+    if (liveAmount !== null) {
+      if (cfg.tickAmount === 'intervalDelta') {
+        var delta = liveAmount - liveBaseline
+        if (delta > 0) return { amount: delta, live: true }
+        return null
+      }
+      if (liveAmount > 0) return { amount: liveAmount, live: true }
+      return null
+    }
+    if (lastKnownAmount !== null && lastKnownAmount > 0) return { amount: lastKnownAmount, live: false }
+    return null
+  }
+
+  // 工作中间隔跳动:无条件跳(不做概率判定),金额 = **本轮到目前为止的真实花费**。
   // 之所以不做概率判定:用户要的就是"只要在干活就一直在输出";概率那一层留给每轮结束那一次
   // (那条路径仍走 rollDamage,所以「区间/概率」这些设置依然有意义)。
   function burstTick() {
     if (!wantWorkingMode()) return false
-    if (lastKnownAmount === null) return false   // 还没读到过任何真实金额 → 宁可不跳,也不编一个
+    var pick = burstAmount()
+    if (!pick) return false
+    if (pick.live && cfg.tickAmount === 'intervalDelta') liveBaseline = liveAmount
+    liveIsMirror = !!pick.live
     runtime.triggers++
-    runtime.lastTrigger = 'working'
-    spawn(lastKnownAmount)
+    runtime.lastTrigger = pick.live ? 'working-live' : 'working-last'
+    spawn(pick.amount)
     return true
   }
 
@@ -448,7 +499,7 @@
     if (cfg.enabled === false) return false
     if (cfg.mode !== 'working') return false
     if (!working) return false
-    if (lastKnownAmount === null) return false   // 还没读到过任何真实金额 → 宁可不跳,也不编一个
+    if (liveAmount === null && lastKnownAmount === null) return false  // 一个可用的金额都没有 → 宁可不跳,也不编一个
     if (!lastBurstAt) return false
     return (num(now, Date.now()) - lastBurstAt) >= tickSecMs()
   }
@@ -477,6 +528,7 @@
     if (working && !was) {
       workingSince = Date.now()
       lastBurstAt = Date.now()   // 第一跳从"开始工作"起算一个完整间隔,不立刻喷一个
+      liveBaseline = 0           // 新一轮开始:增量基线归零
     }
     if (!working && was) {
       workingSince = null
@@ -486,14 +538,33 @@
   }
 
   // ---- 活动状态(「工作中持续跳动」的依据)----
+  // activity.json 与 SSE 的 activity 帧是**同一个载荷**,统一从这里进,免得两处规则漂移。
+  function applyActivityPayload(d) {
+    if (!d || typeof d !== 'object') return null
+    // 本轮进行中的镜像金额(宿主按挂件公式算的)
+    var live = d.live
+    if (live && typeof live === 'object' && isFinite(Number(live.amount))) {
+      var amt = num(live.amount, 0)
+      var turn = live.turn == null ? null : live.turn
+      if (liveTurn !== null && turn !== null && turn !== liveTurn) liveBaseline = 0   // 换轮次:重置增量基线
+      liveAmount = amt
+      liveTurn = turn
+      liveTokens = num(live.tokens, 0)
+    }
+    // 「只在主会话」时,子代理在跑不算"我在干活"
+    return {
+      busy: cfg.mainSessionOnly === true ? !!d.mainWorking : !!d.working,
+      live: !!live,
+    }
+  }
+
   function syncActivity() {
     if (!wantWorkingMode()) return Promise.resolve(null)
     return fetchJson(ENDPOINT_ACTIVITY)
       .then(function (d) {
         if (!d || d.ok !== true) return null
-        // 「只在主会话」时,子代理在跑不算"我在干活"
-        var busy = cfg.mainSessionOnly === true ? !!d.mainWorking : !!d.working
-        setWorking(busy)
+        var st = applyActivityPayload(d)
+        if (st) setWorking(st.busy)
         return d
       })
       .catch(function (err) {
@@ -557,19 +628,22 @@
       esReady = true
       runtime.sseState = 'ready'
     })
-    // 活动状态帧:只让"开始/结束工作"反应更快;可信来源仍是 activity.json 的 3 秒轮询
+    // 活动状态帧:让"开始/结束工作"和**本轮进行中金额**都反应更快
+    // (载荷与 activity.json 完全相同,所以走同一个 applyActivityPayload,规则不会漂移)
     es.addEventListener('activity', function (ev) {
       var d = null
       try { d = JSON.parse(ev.data) } catch (err) { d = null }
       if (!d) return
-      setWorking(cfg.mainSessionOnly === true ? !!d.mainWorking : !!d.working)
+      var st = applyActivityPayload(d)
+      if (st) setWorking(st.busy)
     })
     es.addEventListener('turn', function (ev) {
       var d = null
       try { d = JSON.parse(ev.data) } catch (err) { d = null }
       // 「只在主会话结算」:子代理的 turn/end 不当成一整轮对话
       if (cfg.mainSessionOnly === true && d && d.isSubagent) return
-      tick('push')
+      // 结算前把本轮进行中的累计再取一次(拿挂件给的真实金额与它对比自检)
+      syncActivity().then(function () { tick('push') }, function () { tick('push') })
     })
     // 重连成功也立刻取一次:断线期间结束的轮次由此补上,不依赖下一次轮询
     es.onopen = function () {
@@ -605,7 +679,7 @@
   }
 
   var hook = {
-    version: '0.3.2',
+    version: '0.4.0',
     DEFAULT_CFG: DEFAULT_CFG,
     getConfig: function () { return Object.assign({}, cfg) },
     setConfig: function (patch) { return applyConfig(Object.assign({}, cfg, patch || {})) },
@@ -627,6 +701,8 @@
     tick: tick,
     burstTick: burstTick,          // 立刻手动来一次"工作中间隔跳动"(便于测试与试看)
     shouldBurst: shouldBurst,      // 该不该跳的纯判断(测试用,不必驱动定时器)
+    burstAmount: burstAmount,      // 这一跳要跳多少钱的纯判断(测试用)
+    checkLiveDrift: checkLiveDrift, // 镜像计价自检(测试用)
     headPoint: headPoint,
     syncActivity: syncActivity,    // 立刻刷新一次"是否在干活"
     reset: function () { baseline = null; return true },
@@ -648,6 +724,14 @@
         workingSince: workingSince,
         lastBurstAt: lastBurstAt,
         lastKnownAmount: lastKnownAmount,
+        // 持续模式真正跳的数字来源
+        tickAmount: cfg.tickAmount === 'intervalDelta' ? 'intervalDelta' : 'turnTotal',
+        liveAmount: liveAmount,
+        liveTurn: liveTurn,
+        liveTokens: liveTokens,
+        liveBaseline: liveBaseline,
+        liveIsMirror: liveIsMirror,
+        liveSource: liveAmount === null ? (lastKnownAmount === null ? '无' : '上一轮金额(兜底)') : '本轮镜像计价',
         supervisorOn: !!supervisorTimer,
         activityPollOn: !!activityTimer,
       }
@@ -672,6 +756,7 @@
         console.info('[dsh-damage-number] overlay ' + hook.version + ' 就绪'
           + '  mode=' + (cfg.mode === 'working' ? 'working' : 'turnEnd')
           + '  tickSec=' + num(cfg.tickSec, 5)
+          + (cfg.mode === 'working' ? ('  口径=' + (cfg.tickAmount === 'intervalDelta' ? 'intervalDelta' : 'turnTotal')) : '')
           + '  推送=' + runtime.sseState
           + '  轮询=' + curPollMs + 'ms'
           + (cfg.mode === 'working' ? ('  监督器=' + (!!supervisorTimer) + '  活动轮询=' + (!!activityTimer)) : ''))

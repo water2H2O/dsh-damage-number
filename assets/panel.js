@@ -310,7 +310,8 @@
       if (isWorking) {
         var sec = Number(C.tickSec.value)
         if (!isFinite(sec) || sec < 0.5) sec = 5
-        setText(C.modeHint, '干活期间每 ' + sec + ' 秒跳一次(数字 = 上一轮的金额);每轮结束那次仍按区间概率判定。')
+        setText(C.modeHint, '干活期间每 ' + sec + ' 秒跳一次:数字 = 本轮到目前为止的真实花费(逐条累加,不是估算);'
+          + '每轮结束那次仍按区间概率判定。')
       } else {
         setText(C.modeHint, '每轮结束时按区间概率跳一次:到上限必定跳;上下限填一样 = 纯阈值。')
       }

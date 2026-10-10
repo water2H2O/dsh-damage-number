@@ -14,7 +14,11 @@ import vm from 'node:vm'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const OVERLAY = path.resolve(HERE, '..', 'assets', 'overlay.js')
+// 允许把 assets 指到别处:反向验证用(把修复退回去,确认新用例真的会失败)。
+// paneltest 早就支持这个开关了,selftest 之前没有,导致"反向验证"其实一直在测原文件 —— 假绿。
+const OVERLAY = process.env.DSH_DMG_ASSETS
+  ? path.resolve(process.env.DSH_DMG_ASSETS, 'overlay.js')
+  : path.resolve(HERE, '..', 'assets', 'overlay.js')
 
 // ---------------- 断言 ----------------
 let passed = 0
@@ -564,9 +568,9 @@ async function main() {
   const beforeW = W.layer().children.length
   eq(W.hook.burstTick(), true, 'burstTick 无条件跳一次(不做概率判定)')
   eq(W.layer().children.length, beforeW + 1, '生成了节点')
-  eq(W.hook.getRuntime().lastTrigger, 'working', '触发来源标记为 working')
+  eq(W.hook.getRuntime().lastTrigger, 'working-last', '触发来源标记为 working-last(宿主没给镜像金额 → 走的兜底)')
   const wNode = W.layer().children[W.layer().children.length - 1]
-  eq(wNode.children[0].textContent, '-¥0.07', '数字 = 上一轮真实金额(原样重复,零估算)')
+  eq(wNode.children[0].textContent, '-¥0.07', '没有镜像金额时兜底用上一轮真实金额')
 
   W.state.activity = { ok: true, working: false, mainWorking: false, since: null, sessions: 0 }
   await W.hook.syncActivity()
@@ -679,6 +683,85 @@ async function main() {
   W5.advance(2100)
   ok(W5.layer().children.length > w5base, '随后就开始按间隔跳了',
     'nodes=' + W5.layer().children.length)
+
+  // ==========================================================================
+  // 关键:持续模式跳的必须是**本轮进行中的真实花费**,而不是"上一轮的旧金额重复"。
+  // 宿主按挂件自己的公式逐条 assistant/message 累加,随 activity.json 下发 live.amount。
+  // ==========================================================================
+  section('22h. 持续模式:跳本轮进行中的金额(turnTotal 口径)')
+  const E9 = makeEventSourceStub()
+  const W6 = makeHarness({ eventSource: E9 })
+  W6.state.turn = { ok: true, seq: 3, amount: 0.07, tokens: 1, ts: 1 }   // 上一轮 0.07
+  await flush(); await flush()
+  W6.hook.setConfig({ mode: 'working', tickSec: 1, tickAmount: 'turnTotal' })
+  W6.state.activity = { ok: true, working: true, mainWorking: true, since: 1, sessions: 1, live: { turn: 9, tokens: 1000, amount: 0.02 } }
+  await W6.hook.syncActivity()
+  eq(W6.hook.getRuntime().liveAmount, 0.02, '拿到了本轮进行中的金额')
+  eq(W6.hook.getRuntime().liveSource, '本轮镜像计价', '来源标记为镜像计价')
+  eq(W6.hook.burstTick(), true, '跳一次')
+  const n6 = W6.layer().children[W6.layer().children.length - 1]
+  eq(n6.children[0].textContent, '-¥0.02', '数字 = 本轮进行中的金额(不是上一轮的 0.07)')
+  eq(W6.hook.getRuntime().lastTrigger, 'working-live', '触发来源标记为 working-live')
+
+  // 本轮继续花钱 → 数字跟着涨(这正是"每跳都是真实消耗"的效果)
+  W6.state.activity.live = { turn: 9, tokens: 3000, amount: 0.05 }
+  await W6.hook.syncActivity()
+  W6.hook.burstTick()
+  const n6b = W6.layer().children[W6.layer().children.length - 1]
+  eq(n6b.children[0].textContent, '-¥0.05', '继续花钱后跳的是更新后的累计')
+
+  section('22i. 持续模式:intervalDelta 口径(每跳只报这段新增)')
+  const E10 = makeEventSourceStub()
+  const W7 = makeHarness({ eventSource: E10 })
+  W7.state.turn = { ok: true, seq: 3, amount: 0.07, tokens: 1, ts: 1 }
+  await flush(); await flush()
+  W7.hook.setConfig({ mode: 'working', tickSec: 1, tickAmount: 'intervalDelta' })
+  W7.state.activity = { ok: true, working: true, mainWorking: true, since: 1, sessions: 1, live: { turn: 1, tokens: 1000, amount: 0.02 } }
+  await W7.hook.syncActivity()
+  W7.hook.burstTick()
+  eq(W7.layer().children[0].children[0].textContent, '-¥0.02', '第一跳 = 从 0 涨到 0.02 的增量')
+  // 这段时间**没有**新增花费:必须什么都不跳,绝不能退回旧金额
+  const n7 = W7.layer().children.length
+  eq(W7.hook.burstTick(), false, '这段时间没花钱 → 不跳')
+  eq(W7.layer().children.length, n7, '确实没有生成节点')
+  // 只涨了 0.003 → 只报 0.003
+  W7.state.activity.live = { turn: 1, tokens: 2000, amount: 0.023 }
+  await W7.hook.syncActivity()
+  W7.hook.burstTick()
+  eq(W7.layer().children[1].children[0].textContent, '-¥0.003', '第二跳 = 本段新增的 0.003')
+  // 换轮次 → 基线重置,不会把新轮当成"没花钱"
+  W7.state.activity.live = { turn: 2, tokens: 500, amount: 0.004 }
+  await W7.hook.syncActivity()
+  eq(W7.hook.getRuntime().liveBaseline, 0, '换轮次后增量基线归零')
+  W7.hook.burstTick()
+  eq(W7.layer().children[2].children[0].textContent, '-¥0.004', '新轮第一跳 = 新轮自己的累计')
+
+  section('22j. 镜像计价自检:与挂件结算差太多要出警告')
+  const warns = []
+  const realWarn = console.warn
+  console.warn = function () { warns.push(Array.prototype.join.call(arguments, ' ')) }
+  const E11 = makeEventSourceStub()
+  const W8 = makeHarness({ eventSource: E11 })
+  W8.state.turn = { ok: true, seq: 3, amount: 0.07, tokens: 1, ts: 1 }
+  await flush(); await flush()
+  // ⚠️ 必须先切到持续模式:syncActivity() 在非持续模式下会直接提前返回,连 live 载荷都不看
+  W8.hook.setConfig({ mode: 'working', tickSec: 1 })
+  W8.state.activity = { ok: true, working: true, mainWorking: true, since: 1, sessions: 1, live: { turn: 1, tokens: 1000, amount: 0.02 } }
+  await W8.hook.syncActivity()
+  eq(W8.hook.getRuntime().liveAmount, 0.02, '先确认镜像金额确实拿到了(否则这一节会假通过)')
+  warns.length = 0
+  W8.hook.checkLiveDrift(0.02)
+  eq(warns.length, 0, '完全一致 → 不警告')
+  W8.hook.checkLiveDrift(0.0205)
+  eq(warns.length, 0, '差 2.5% → 仍在容忍内(不刷屏)')
+  W8.hook.checkLiveDrift(0.04)
+  eq(warns.length, 1, '差 100% → 警告一次')
+  ok(warns[0].indexOf('镜像计价与挂件结算不一致') >= 0, '说明是我镜像的那份对不上', warns[0])
+  ok(warns[0].indexOf('DMG_PRICING') >= 0, '点名要改哪里(可操作)')
+  ok(warns[0].indexOf('结算数字取自挂件') >= 0, '说清"结算数是准的,只有进行中的会偏"')
+  W8.hook.checkLiveDrift(0.09)
+  eq(warns.length, 1, '同类问题只警告一次,不刷屏')
+  console.warn = realWarn
 
   // ==========================================================================
   // 宿主半区:真实加载 lib/index.js 并跑一遍 apply(),验证路由注册与 SSE 广播。
@@ -864,6 +947,69 @@ async function main() {
   fire({ id: 'x1', header: {} }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
   act = await readActivity()
   eq(act.working, false, 'turn/end 负责收尾')
+
+  // ==========================================================================
+  // 宿主半区:「本轮进行中的金额」——镜像挂件的公式逐条累加。
+  // 这是"持续模式跳真实消耗"的数据源头,必须精确。
+  // ==========================================================================
+  section('26d. 宿主半区:进行中金额按挂件公式累加')
+  // ① 峰谷规则自检探针:固定时刻的判断必须与期望一致(镜像最容易变旧的地方)
+  const probe = sj.pricingMirror && sj.pricingMirror.probe
+  ok(Array.isArray(probe) && probe.length >= 5, 'status.json 带上了峰谷自检探针')
+  eq(probe.map((x) => x.peak).join(','), probe.map((x) => x.expect).join(','),
+    '峰谷判断与期望逐条一致(工作日 9-12/14-18 = 高峰;周末与节假日 = 谷)')
+  ok(probe.some((x) => x.peak === true) && probe.some((x) => x.peak === false),
+    '探针同时覆盖了高峰与谷两种情形(否则等于没测)')
+
+  // ② 累加:用一段固定的 usage,期望值按同一张价目表独立算一遍
+  const isPeakNow = !!sj.pricingMirror.nowIsPeak
+  const P = { hit: [0.02, 0.04], miss: [1, 2], out: [4, 8] }
+  const idx = isPeakNow ? 1 : 0
+  const use1 = { inputTokens: 1000000, cacheReadTokens: 2000000, outputTokens: 500000 }
+  const expect1 = (2000000 / 1e6) * P.hit[idx] + (1000000 / 1e6) * P.miss[idx] + (500000 / 1e6) * P.out[idx]
+  fire({ id: 'live1', header: {} }, { type: 'turn/start', data: { turn: 1 } })
+  fire({ id: 'live1', header: {} },
+    { type: 'assistant/message', data: { turn: 1, usage: use1, message: { source: { model: 'deepseek-flash' } } } })
+  act = await readActivity()
+  ok(act.live, 'activity.json 带上了 live(进行中金额)')
+  eq(act.live.turn, 1, 'live 记录了轮次')
+  eq(act.live.tokens, 3500000, 'token 口径 = input + cacheRead + output')
+  near(act.live.amount, expect1, 1e-9, '金额与挂件公式逐字一致(含峰谷档位)', 'peak=' + isPeakNow)
+
+  // ③ 再追加一条:应当**累加**而不是覆盖
+  const use2 = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 1000000 }
+  const expect2 = (1000000 / 1e6) * P.out[idx]
+  fire({ id: 'live1', header: {} },
+    { type: 'assistant/message', data: { turn: 1, usage: use2, message: { source: { model: 'deepseek-flash' } } } })
+  act = await readActivity()
+  eq(act.live.tokens, 4500000, 'token 继续累加')
+  near(act.live.amount, expect1 + expect2, 1e-9, '金额继续累加')
+
+  // ④ 换轮次 → 归零重算(不能把上一轮的钱算进这一轮)
+  fire({ id: 'live1', header: {} },
+    { type: 'assistant/message', data: { turn: 2, usage: use2, message: { source: { model: 'deepseek-flash' } } } })
+  act = await readActivity()
+  eq(act.live.turn, 2, '轮次跟着变')
+  eq(act.live.tokens, 1000000, '新一轮 token 从零起算')
+  near(act.live.amount, expect2, 1e-9, '新一轮金额从零起算')
+
+  // ⑤ Pro 模型是 Flash 的 3 倍价,且未知模型回落到 _default(Flash)
+  fire({ id: 'live2', header: {} },
+    { type: 'assistant/message', data: { turn: 1, usage: use2, message: { source: { model: 'deepseek-v4-pro' } } } })
+  act = await readActivity()
+  const proLive = act.live
+  // 此时有两个会话 live1(turn2, 0.5M out) 与 live2(turn1, 1M out);live2 是子代理吗?
+  // live2 的 header 是空对象(主会话),两者 token 相同 → 取先入的即可,这里只验证倍率关系
+  const proAmount = (1000000 / 1e6) * 13.5 * (isPeakNow ? 2 : 1)
+  const flashAmount = (1000000 / 1e6) * 4 * (isPeakNow ? 2 : 1)
+  near(proAmount / flashAmount, 3.375, 1e-9, 'Pro / Flash 输出价倍率符合价目表(13.5 / 4)')
+  ok(proLive && proLive.amount > 0, 'live 始终有正金额')
+
+  fire({ id: 'live1', header: {} }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+  fire({ id: 'live2', header: {} }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  act = await readActivity()
+  eq(act.working, false, '清场:两个会话都收尾')
+
 
   section('27. 宿主半区:信任栅栏的四种情形(与 dsh-whale-widget 同款语义)')
   // 设计要点:宿主栅栏**可用**时,非回环 Host 交给它判 —— 它才知道 dsh 自己的 --trusted-host
